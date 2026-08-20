@@ -1,5 +1,16 @@
 # Production Pipelines
 
+Production submission ownership is intentionally singular:
+
+```text
+scripts/competition.sh run -> src.cli.competition_run -> HCMAIPipeline -> submission adapter
+```
+
+`codabench_submit.py` remains a serializer plus a compatibility-only,
+single-task CLI for regression or migration. It is never the default
+production orchestrator; invoking its CLI requires `--compatibility-only`.
+Use `./scripts/competition.sh run` for competition submissions.
+
 Task-level pipelines live here:
 
 - `kis_fusion_retriever.py`: KIS production visual candidate generation.

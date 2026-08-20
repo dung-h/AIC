@@ -219,7 +219,10 @@ def test_codabench_rejects_mixed_tasks_without_creating_output(monkeypatch, tmp_
     monkeypatch.setattr(
         sys,
         "argv",
-        ["codabench_submit.py", "--input", str(input_path), "--output", str(output_path), "--offline"],
+        [
+            "codabench_submit.py", "--compatibility-only", "--input", str(input_path),
+            "--output", str(output_path), "--offline",
+        ],
     )
     with pytest.raises(ValueError, match="mixed task_type"):
         codabench_submit.main()

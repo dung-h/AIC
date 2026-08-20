@@ -230,9 +230,11 @@ def run_competition(specs: list[QuerySpec], *, output: Path, answer_provider: st
     # All retrieval/model artifacts are local even in the API answer profile.
     # This prevents sentence-transformers/transformers from probing the Hub;
     # the explicit answer provider remains the only allowed network boundary.
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # These are assignments, rather than defaults: a caller must not be able
+    # to re-enable model/download traffic by inheriting a permissive shell.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     from src.pipelines.hcmai_pipeline import HCMAIPipeline
 
@@ -240,7 +242,9 @@ def run_competition(specs: list[QuerySpec], *, output: Path, answer_provider: st
     if answer_provider == "openai":
         policy = base.override(
             execution_mode="production", network_mode="online",
-            vqa_answer_provider="openai", vqa_modality_routing=modality_routing,
+            vqa_answer_provider="openai", kis_remote_translation=False,
+            trake_remote_embeddings=False,
+            vqa_modality_routing=modality_routing,
         )
     else:
         policy = base.override(
@@ -273,7 +277,7 @@ def run_competition(specs: list[QuerySpec], *, output: Path, answer_provider: st
             answers = result.get("answers", [])
             entry = {"task": "qa", "query_id": spec.query_id, "answers": answers}
         else:
-            result = pipe.trake(spec.events, topk=topk, mode="visual")
+            result = pipe.trake(spec.events, topk=topk, mode=policy.trake_mode)
             answers = [{
                 "video_id": item.get("video_id"),
                 "frame_ids": [int(step["frame_idx"]) for step in item.get("path", [])],
@@ -291,7 +295,12 @@ def run_competition(specs: list[QuerySpec], *, output: Path, answer_provider: st
         print(f"[{position}/{len(specs)}] {spec.task.upper()} {spec.query_id}: "
               f"{len(answers)} answers in {elapsed:.2f}s", flush=True)
 
-    canonical = {task: _canonical_pairs(pipe, task, "visual") for task in task_seen}
+    canonical = {
+        task: _canonical_pairs(
+            pipe, task, policy.trake_mode if task == "trake" else None,
+        )
+        for task in sorted(task_seen)
+    }
     package = write_aic26_mixed_submission_zip(
         entries, output, canonical_frames_by_task=canonical,
     )

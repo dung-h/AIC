@@ -1,9 +1,11 @@
 # Deployment and asset transfer
 
-The public Git repository contains source, tests, configuration and operational
-documentation. Corpora, vector indexes, model weights, keyframe images, caches,
-private annotations/holdout evidence, submissions and experiment outputs stay
-outside Git.
+The public Git repository contains the deployable source, its offline contract
+tests, configuration and operational documentation. Corpora, vector indexes,
+model weights, keyframe images, caches, private annotations/holdout evidence,
+submissions and experiment outputs stay outside Git. Data-backed benchmark
+generators and their tests remain in the private workspace too: they cannot be
+run honestly from a source-only clone without their holdout evidence.
 
 Create a source-only handoff archive from the same Git ignore contract:
 

@@ -12,27 +12,10 @@ hcmai_trim() {
   printf '%s' "$value"
 }
 
-hcmai_apply_legacy_env_aliases() {
-  local legacy canonical value
-  while IFS=':' read -r legacy canonical; do
-    value="${!legacy:-}"
-    if [[ -z "${!canonical+x}" && -n "$value" ]]; then
-      export "$canonical=$value"
-    fi
-  done <<'EOF'
-DO_INFERENCE_BASE:VLM_BASE_URL
-DO_INFERENCE_KEY:VLM_API_KEY
-DO_VLM_MODEL:VLM_MODEL
-EOF
-}
-
 hcmai_load_dotenv() {
   local env_file="${1:?dotenv path is required}"
   local raw line key value
 
-  # Treat pre-existing legacy names as explicit process overrides before file
-  # values are materialized, matching src.utils.paths.load_runtime_env().
-  hcmai_apply_legacy_env_aliases
   [[ -f "$env_file" ]] || return 0
 
   while IFS= read -r raw || [[ -n "$raw" ]]; do
@@ -53,7 +36,4 @@ hcmai_load_dotenv() {
     [[ -v "$key" ]] || export "$key=$value"
   done < "$env_file"
 
-  # Map a legacy field contained in .env only when no canonical field was
-  # already provided by the process or the same dotenv file.
-  hcmai_apply_legacy_env_aliases
 }

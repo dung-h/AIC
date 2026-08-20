@@ -1,5 +1,4 @@
 from src.core.providers import provider_for
-from src.utils.paths import load_env
 import pytest
 
 
@@ -14,17 +13,23 @@ def test_text_provider_is_role_separated():
     assert provider.model == "text-model"
 
 
-def test_vision_legacy_alias_is_normalized_at_config_boundary(tmp_path):
-    env_path = tmp_path / ".env"
-    env_path.write_text(
-        "DO_INFERENCE_BASE=https://vision.example/v1\n"
-        "DO_INFERENCE_KEY=test-key\n"
-        "DO_VLM_MODEL=vision-model\n",
-        encoding="utf-8",
-    )
-    provider = provider_for("vision", load_env(env_path))
+def test_vision_requires_standardized_role_keys():
+    provider = provider_for("vision", {
+        "VLM_BASE_URL": "https://vision.example/v1",
+        "VLM_API_KEY": "test-key",
+        "VLM_MODEL": "vision-model",
+    })
     assert provider.configured
     assert provider.model == "vision-model"
+
+
+def test_unsupported_provider_names_do_not_configure_vision():
+    provider = provider_for("vision", {
+        "UNSUPPORTED_VISION_BASE": "https://vision.example/v1",
+        "UNSUPPORTED_VISION_KEY": "test-key",
+        "UNSUPPORTED_VISION_MODEL": "vision-model",
+    })
+    assert not provider.configured
 
 
 def test_embedding_requires_its_own_capability():

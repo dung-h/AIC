@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+import src.service.app as service_app
 from src.service.app import app
 from src.service.contracts import RetrievalResult
 from src.service.runtime import get_runtime
@@ -50,3 +51,10 @@ def test_trake_contract_with_mock_runtime(monkeypatch):
 def test_trake_rejects_blank_event():
     response = TestClient(app).post("/search/trake", json={"events": [" "]})
     assert response.status_code == 422
+
+
+def test_annotation_endpoints_fail_closed_without_private_workspace(monkeypatch):
+    monkeypatch.setattr(service_app, "annotation_review", None)
+    response = TestClient(app).get("/annotation/rows")
+    assert response.status_code == 503
+    assert "private" in response.json()["detail"]

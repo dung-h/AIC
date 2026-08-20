@@ -7,17 +7,21 @@ Each query is stored as one UTF-8, headerless CSV with at most 100 rows:
 * QA: ``video_id,frame_idx,answer``
 * TRAKE: ``video_id,frame_1,...,frame_N``
 
-The historical 2025 and ranked JSON/CSV adapters remain available explicitly
-for compatibility.  They are not the official AIC26 transport.
+The historical single-task CLI and 2025/ranked JSON/CSV adapters remain
+available only behind an explicit compatibility opt-in.  They are not the
+official AIC26 production entrypoint.  Production submissions must use
+``./scripts/competition.sh run`` which delegates to
+``src.cli.competition_run``.
 
 Hệ thống: dùng HCMAIPipeline (4 task: KIS, VKIS, VQA, TRAKE)
 KIS dùng KISFusionRetriever (ViT-L + SO400M-384 zscore fusion).
 
-Cách dùng AIC26 chính thức:
-  python codabench_submit.py --input queries.csv --output answer.zip --task KIS
+Cách dùng production AIC26:
+  ./scripts/competition.sh run --queries queries.json --output answer.zip
 
-``.zip`` tự chọn ``aic2026_official``; các format cũ vẫn có thể chọn rõ
-qua ``--format`` để phục vụ regression/compatibility.
+Chỉ dùng CLI này cho regression/migration có chủ đích:
+  python -m src.pipelines.codabench_submit --compatibility-only \\
+    --input queries.csv --output answer.zip --task KIS
 
 Input CSV expected columns:
   query_id, query, [task_type] (KIS/VKIS/VQA/TRAKE)
@@ -52,6 +56,12 @@ AIC26_OFFICIAL_FORMAT = "aic2026_official"
 AIC26_MAX_ROWS = 100
 AIC26_MAX_ANSWER_CHARS = 100
 _AIC26_QUERY_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
+COMPATIBILITY_CLI_REDIRECT = (
+    "codabench_submit.py is a compatibility-only single-task adapter; "
+    "use ./scripts/competition.sh run --queries QUERY.json --output ANSWER.zip "
+    "for production submissions. To run this legacy CLI deliberately, pass "
+    "--compatibility-only."
+)
 
 
 def _aic26_task(task):
@@ -529,7 +539,17 @@ def _submission_policy(policy, task: str, offline: bool):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Compatibility-only single-task submission adapter."
+    )
+    parser.add_argument(
+        "--compatibility-only",
+        action="store_true",
+        help=(
+            "Acknowledge this is a compatibility/migration CLI, not the "
+            "production submission entrypoint"
+        ),
+    )
     parser.add_argument("--input", required=True, help="Input CSV (query_id, query, [task_type])")
     parser.add_argument("--output", default="submission.csv")
     parser.add_argument("--task", default=None, help="Force task type: KIS/VKIS/VQA/TRAKE")
@@ -556,6 +576,16 @@ def main():
                         help="Optional JSON sidecar for submission validation/diagnostics")
     parser.add_argument("--trake-mode", choices=["visual", "asr"], default=None,
                         help="Local override; otherwise use RuntimePolicy.from_env()")
+    # Check the raw CLI before argparse validates required single-task inputs.
+    # A bare invocation should redirect to the single production spine instead
+    # of presenting this compatibility adapter as an ordinary submission CLI.
+    raw_args = sys.argv[1:]
+    if (
+        "--compatibility-only" not in raw_args
+        and "--help" not in raw_args
+        and "-h" not in raw_args
+    ):
+        parser.error(COMPATIBILITY_CLI_REDIRECT)
     args = parser.parse_args()
 
     from src.runtime_policy import RuntimePolicy

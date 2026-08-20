@@ -238,6 +238,7 @@ def test_cli_official_qa_writes_one_csv_per_query(monkeypatch, tmp_path):
         "argv",
         [
             "codabench_submit.py",
+            "--compatibility-only",
             "--input", str(input_path),
             "--output", str(output),
             "--task", "VQA",
@@ -284,7 +285,7 @@ def test_cli_official_qa_allows_explicit_online_provider(monkeypatch, tmp_path):
         sys,
         "argv",
         [
-            "codabench_submit.py", "--input", str(input_path),
+            "codabench_submit.py", "--compatibility-only", "--input", str(input_path),
             "--output", str(output), "--task", "VQA",
             "--answer-provider", "openai",
         ],
@@ -321,7 +322,10 @@ def test_cli_official_kis_branch_uses_two_columns(monkeypatch, tmp_path):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["codabench_submit.py", "--input", str(input_path), "--output", str(output)],
+        [
+            "codabench_submit.py", "--compatibility-only", "--input", str(input_path),
+            "--output", str(output),
+        ],
     )
 
     codabench_submit.main()
@@ -368,6 +372,7 @@ def test_cli_official_trake_branch_uses_video_plus_n_frames(monkeypatch, tmp_pat
         "argv",
         [
             "codabench_submit.py",
+            "--compatibility-only",
             "--input", str(input_path),
             "--output", str(output),
             "--task", "TRAKE",
@@ -380,3 +385,27 @@ def test_cli_official_trake_branch_uses_video_plus_n_frames(monkeypatch, tmp_pat
     with zipfile.ZipFile(output) as bundle:
         _, rows = _read_csv_member(bundle, "submission/query-1-trake.csv")
         assert rows == [["V1", "10", "30"]]
+
+
+def test_cli_requires_explicit_compatibility_opt_in(monkeypatch, tmp_path, capsys):
+    """The standalone CLI must not accidentally become a production owner."""
+    from src.pipelines import codabench_submit
+
+    output = tmp_path / "submission.zip"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "codabench_submit.py", "--input", str(tmp_path / "queries.csv"),
+            "--output", str(output),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        codabench_submit.main()
+
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "compatibility-only" in stderr
+    assert "./scripts/competition.sh run" in stderr
+    assert not output.exists()

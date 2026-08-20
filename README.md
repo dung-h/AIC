@@ -95,9 +95,9 @@ cp .env.example .env
 
 Remote capabilities are role-separated: `TEXT_*` for rewriting, `VLM_*` for
 image-aware answering/reranking, and `EMBEDDING_*` for remote text embeddings.
-The offline competition default needs no API key. Legacy `DO_*` vision names
-are read only as a migration alias at the configuration boundary; new
-deployments must use the role-specific keys in `.env.example`.
+The offline competition default needs no API key. Provider configuration
+accepts only these role-specific keys; unsupported names are never translated
+or used as provider fallbacks.
 
 Configure a personal/team `rclone` remote named `gdrive`, then inspect the
 local state first. `plan` makes no network call. `fetch --yes` is explicit,

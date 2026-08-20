@@ -13,7 +13,23 @@ from typing import Annotated
 
 from src.service.runtime import get_runtime
 from src.service.contracts import RetrievalResult
-from src.service import annotation_review
+
+# Annotation authoring belongs to the private benchmark workspace.  The
+# retrieval service is still a supported public/runtime component, so an
+# absent private queryset must not prevent its health/search endpoints from
+# starting on a clean deployment clone.
+try:
+    from src.service import annotation_review
+except ImportError as error:
+    missing_private_workspace = (
+        error.name == "src.service.annotation_review"
+        or (error.name and error.name.startswith("src.queryset"))
+        or "annotation_review" in str(error)
+    )
+    if missing_private_workspace:
+        annotation_review = None
+    else:
+        raise
 
 
 class KISRequest(BaseModel):
@@ -100,6 +116,18 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="HCMAI Retrieval Service", version="1.0", lifespan=lifespan)
 
 
+def _annotation_workspace():
+    if annotation_review is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "annotation workspace is private and is not installed in "
+                "this runtime source bundle"
+            ),
+        )
+    return annotation_review
+
+
 @app.get("/health")
 def health():
     return get_runtime().health()
@@ -152,13 +180,13 @@ def annotation_triage_page():
 
 @app.get("/annotation/rows")
 def annotation_rows():
-    return annotation_review.list_rows()
+    return _annotation_workspace().list_rows()
 
 
 @app.put("/annotation/rows/{annotation_id}")
 def update_annotation(annotation_id: str, update: AnnotationUpdate):
     try:
-        return annotation_review.save(annotation_id, update.model_dump())
+        return _annotation_workspace().save(annotation_id, update.model_dump())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="unknown annotation") from exc
     except ValueError as exc:
@@ -167,14 +195,14 @@ def update_annotation(annotation_id: str, update: AnnotationUpdate):
 
 @app.post("/annotation/export")
 def export_annotations():
-    return annotation_review.export_reviewed()
+    return _annotation_workspace().export_reviewed()
 
 
 @app.get("/annotation/evidence/{annotation_id}/{filename}")
 def annotation_evidence(annotation_id: str, filename: str):
     if "/" in annotation_id or "\\" in annotation_id or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=404, detail="not found")
-    path = annotation_review.PACK / "evidence" / annotation_id / filename
+    path = _annotation_workspace().PACK / "evidence" / annotation_id / filename
     if not path.is_file() or path.suffix.lower() != ".jpg":
         raise HTTPException(status_code=404, detail="evidence missing")
     return FileResponse(path)

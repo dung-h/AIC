@@ -199,8 +199,8 @@ def test_service_trake_delegates_to_hcmai_public_method(monkeypatch):
     assert _method_names(fake) == ["trake"]
 
 
-def test_codabench_cli_uses_the_public_ranked_pipeline(monkeypatch, tmp_path):
-    """The submission CLI is the current positive control for ownership."""
+def test_compatibility_cli_uses_the_public_ranked_pipeline(monkeypatch, tmp_path):
+    """The opt-in compatibility CLI still delegates to the public owner."""
     from src.pipelines import codabench_submit
 
     calls = []
@@ -233,6 +233,7 @@ def test_codabench_cli_uses_the_public_ranked_pipeline(monkeypatch, tmp_path):
         "argv",
         [
             "codabench_submit.py",
+            "--compatibility-only",
             "--input",
             str(input_path),
             "--output",

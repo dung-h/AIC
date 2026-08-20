@@ -15,28 +15,28 @@ from src.utils.paths import activate_runtime_env, load_env, load_runtime_env
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_dotenv_parser_is_safe_and_normalizes_legacy_aliases(tmp_path) -> None:
+def test_dotenv_parser_is_safe_and_preserves_standardized_values(tmp_path) -> None:
     dotenv = tmp_path / ".env"
     dotenv.write_text(
         "# comments are ignored\n"
         "export VQA_MODALITY_ROUTING='1'\n"
         "INVALID-NAME=ignored\n"
-        "DO_INFERENCE_BASE=https://legacy.example/v1\n"
-        "DO_INFERENCE_KEY=legacy-key\n"
-        "DO_VLM_MODEL=legacy-vlm\n",
+        "VLM_BASE_URL=https://vision.example/v1\n"
+        "VLM_API_KEY=vision-key\n"
+        "VLM_MODEL=vision-model\n",
         encoding="utf-8",
     )
 
     values = load_env(dotenv)
 
     assert values["VQA_MODALITY_ROUTING"] == "1"
-    assert values["VLM_BASE_URL"] == "https://legacy.example/v1"
-    assert values["VLM_API_KEY"] == "legacy-key"
-    assert values["VLM_MODEL"] == "legacy-vlm"
+    assert values["VLM_BASE_URL"] == "https://vision.example/v1"
+    assert values["VLM_API_KEY"] == "vision-key"
+    assert values["VLM_MODEL"] == "vision-model"
     assert "INVALID-NAME" not in values
 
 
-def test_explicit_environment_overrides_dotenv_even_when_using_legacy_name(tmp_path) -> None:
+def test_explicit_environment_overrides_dotenv(tmp_path) -> None:
     dotenv = tmp_path / ".env"
     dotenv.write_text(
         "VLM_BASE_URL=https://file.example/v1\n"
@@ -46,7 +46,7 @@ def test_explicit_environment_overrides_dotenv_even_when_using_legacy_name(tmp_p
 
     values = load_runtime_env(
         dotenv,
-        {"DO_INFERENCE_BASE": "https://export.example/v1", "VQA_MODALITY_ROUTING": "1"},
+        {"VLM_BASE_URL": "https://export.example/v1", "VQA_MODALITY_ROUTING": "1"},
     )
 
     assert values["VLM_BASE_URL"] == "https://export.example/v1"
@@ -100,7 +100,7 @@ def test_bash_wrapper_uses_safe_dotenv_parser_with_matching_precedence(tmp_path)
     env.pop("VLM_BASE_URL", None)
     env.pop("VLM_MODEL", None)
     env.pop("VQA_MODALITY_ROUTING", None)
-    env["DO_INFERENCE_BASE"] = "https://export.example/v1"
+    env["VLM_BASE_URL"] = "https://export.example/v1"
     command = (
         f"source {shlex.quote(str(ROOT / 'scripts' / 'runtime_env.sh'))}; "
         f"hcmai_load_dotenv {shlex.quote(str(dotenv))}; "

@@ -40,12 +40,68 @@ PROGRESS.md
 RESEARCH_DIRECTION.md
 STRATEGY.md
 docs/*
-!docs/ARCHITECTURE_MODEL_AGNOSTIC.md
 !docs/ASR_GLOBAL_V2.md
 !docs/DEPLOYMENT_ASSETS.md
 !docs/OCR_GLOBAL_V2.md
 !docs/POLICY_OWNERSHIP.md
 !docs/PRODUCTION_FLOW_CONTRACTS.md
+
+# A prototype model-agnostic facade was never wired to the competition
+# entrypoint. Keep it local for research, but do not publish a second
+# architecture as though it were deployable production code.
+src/architecture/
+docs/ARCHITECTURE_MODEL_AGNOSTIC.md
+tests/test_wave2_parallel_runtime.py
+
+# These tests exercise private, data-backed benchmark scripts under src/eval/.
+# They remain locally available with the private corpus, but cannot be shipped
+# as public tests while their corresponding sources and holdouts are excluded.
+tests/test_architecture_readiness.py
+tests/test_aic2026_scoring.py
+tests/test_annotation_review.py
+tests/test_asr_wave1a.py
+tests/test_benchmark_gates.py
+tests/test_component_bottleneck_report.py
+tests/test_component_readiness_contract.py
+tests/test_ocr_adaptive_v2.py
+tests/test_ocr_corpus_materializer.py
+tests/test_ocr_data_audit.py
+tests/test_normalize_vqa_kf_windows.py
+tests/test_phase7_profile.py
+tests/test_qna_bottleneck_validator.py
+tests/test_qna_cross_modal_contract.py
+tests/test_qna_cross_modal_sidecar.py
+tests/test_qna_eval_provenance.py
+tests/test_qna_eval_protocol_agent.py
+tests/test_qna_global_retrieval_offline.py
+tests/test_qna_gt_frame_oracle.py
+tests/test_qna_metric_correctness_p0.py
+tests/test_qna_modality_scope_evaluator.py
+tests/test_qna_ranked_candidate_pool_contract.py
+tests/test_repair_vqa_ocr_evidence.py
+tests/test_trake_asr_interval_v1.py
+tests/test_trake_evaluator_contract_v1.py
+tests/test_trake_paired_benchmark.py
+tests/test_trake_paired_inputs_v1.py
+tests/test_trake_queryset_validator.py
+tests/test_qna_trake_contracts.py
+tests/test_vqa_answer_layer_p0.py
+tests/test_vqa_lattice_vlm.py
+tests/test_vqa_metrics.py
+tests/test_vqa_modality_alignment.py
+tests/test_vqa_provider_benchmark.py
+tests/test_vqa_benchmark_v3_evidence.py
+tests/test_wave_d_modality_v2_promotion.py
+tests/test_wave2_coverage_readiness.py
+tests/test_wave3_selector_benchmark.py
+tests/test_wave5_benchmark_orchestrator.py
+tests/test_wave5_evidence_registry.py
+tests/test_wsl_runtime_preflight.py
+
+# The annotation review UI and validators operate on private evidence/holdout
+# data. The public service keeps retrieval endpoints and rejects annotation
+# routes explicitly when that workspace is absent.
+src/service/annotation_review.py
 
 # Only operational scripts belong in the public handoff.
 scripts/*

@@ -32,34 +32,11 @@ RESULTS_DIR = REPO_ROOT / "results"
 ENV_PATH = REPO_ROOT / ".env"
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Kept at this boundary so provider and shell migrations have one documented
-# compatibility rule.  New code must read the standardized names only.
-LEGACY_ENV_ALIASES = {
-    "DO_INFERENCE_BASE": "VLM_BASE_URL",
-    "DO_INFERENCE_KEY": "VLM_API_KEY",
-    "DO_VLM_MODEL": "VLM_MODEL",
-}
-
-
 def _strip_optional_quotes(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
-
-
-def normalize_env_aliases(values: Mapping[str, str]) -> dict[str, str]:
-    """Return *values* with temporary legacy names mapped to canonical names.
-
-    Canonical values already present in the same source always win.  Call this
-    before merging configuration sources so an exported legacy variable still
-    overrides a canonical value found in `.env` during the migration window.
-    """
-    result = {str(key): str(value) for key, value in values.items()}
-    for legacy, canonical in LEGACY_ENV_ALIASES.items():
-        if not result.get(canonical, "").strip() and result.get(legacy, "").strip():
-            result[canonical] = result[legacy]
-    return result
 
 
 def dotenv_path(path: str | os.PathLike | None = None) -> Path:
@@ -72,8 +49,7 @@ def load_env(path: str | os.PathLike | None = None) -> dict[str, str]:
     """Parse the shared dotenv file without evaluating shell syntax.
 
     Only ``KEY=VALUE`` and optional ``export KEY=VALUE`` records are accepted.
-    Invalid lines are ignored rather than executed.  Missing files are normal.
-    Legacy DigitalOcean vision names are normalized to the public VLM names.
+    Invalid lines are ignored rather than executed. Missing files are normal.
     """
     env_path = dotenv_path(path)
     out: dict[str, str] = {}
@@ -90,7 +66,7 @@ def load_env(path: str | os.PathLike | None = None) -> dict[str, str]:
                 out[key] = _strip_optional_quotes(value)
     except FileNotFoundError:
         pass
-    return normalize_env_aliases(out)
+    return out
 
 
 def load_runtime_env(
@@ -104,10 +80,8 @@ def load_runtime_env(
     the operating-system environment is the final explicit override.
     """
     values = load_env(path)
-    # Normalize each source independently.  Doing this only after merging
-    # would let a `.env` VLM value mask an explicitly exported legacy value.
     source = os.environ if environ is None else environ
-    values.update(normalize_env_aliases(source))
+    values.update({str(key): str(value) for key, value in source.items()})
     return values
 
 
@@ -117,16 +91,6 @@ def activate_runtime_env(
 ) -> dict[str, str]:
     """Populate missing process values from dotenv; never overwrite an export."""
     target = os.environ if environ is None else environ
-    # An existing legacy name is an explicit override of the matching `.env`
-    # canonical field.  Materialize that mapping before applying file values.
-    for legacy, canonical in LEGACY_ENV_ALIASES.items():
-        if canonical not in target and str(target.get(legacy, "")).strip():
-            target[canonical] = str(target[legacy])
     for key, value in load_env(path).items():
         target.setdefault(key, value)
-    # Also map a legacy value which came from the file itself, but never
-    # replace an explicit canonical value.
-    for legacy, canonical in LEGACY_ENV_ALIASES.items():
-        if canonical not in target and str(target.get(legacy, "")).strip():
-            target[canonical] = str(target[legacy])
     return load_runtime_env(path, target)
