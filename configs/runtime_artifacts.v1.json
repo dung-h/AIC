@@ -1,0 +1,84 @@
+{
+  "schema": "hcmai.runtime_artifacts.v1",
+  "remote_root": "gdrive:HCMAI-2026/runtime",
+  "artifacts": [
+    {
+      "id": "runtime-index",
+      "kind": "tree",
+      "remote_path": "data/index",
+      "target": "data/index",
+      "expected_size_bytes": null,
+      "checksum": {
+        "algorithm": "md5",
+        "value": null,
+        "source": "rclone_remote_metadata",
+        "required": true
+      }
+    },
+    {
+      "id": "keyframes-k01-k05",
+      "kind": "tar",
+      "remote_path": "data/keyframe_archives_v2/keyframes-K01-K05.tar",
+      "target": "data/keyframes",
+      "expected_size_bytes": null,
+      "checksum": {
+        "algorithm": "md5",
+        "value": null,
+        "source": "rclone_remote_metadata",
+        "required": true
+      },
+      "owned_prefixes": ["K01_", "K02_", "K03_", "K04_", "K05_"],
+      "extract": {"strip_components": 0}
+    },
+    {
+      "id": "keyframes-k06-k10",
+      "kind": "tar",
+      "remote_path": "data/keyframe_archives_v2/keyframes-K06-K10.tar",
+      "target": "data/keyframes",
+      "expected_size_bytes": null,
+      "checksum": {"algorithm": "md5", "value": null, "source": "rclone_remote_metadata", "required": true},
+      "owned_prefixes": ["K06_", "K07_", "K08_", "K09_", "K10_"],
+      "extract": {"strip_components": 0}
+    },
+    {
+      "id": "keyframes-k11-k15",
+      "kind": "tar",
+      "remote_path": "data/keyframe_archives_v2/keyframes-K11-K15.tar",
+      "target": "data/keyframes",
+      "expected_size_bytes": null,
+      "checksum": {"algorithm": "md5", "value": null, "source": "rclone_remote_metadata", "required": true},
+      "owned_prefixes": ["K11_", "K12_", "K13_", "K14_", "K15_"],
+      "extract": {"strip_components": 0}
+    },
+    {
+      "id": "keyframes-k16-k20",
+      "kind": "tar",
+      "remote_path": "data/keyframe_archives_v2/keyframes-K16-K20.tar",
+      "target": "data/keyframes",
+      "expected_size_bytes": null,
+      "checksum": {"algorithm": "md5", "value": null, "source": "rclone_remote_metadata", "required": true},
+      "owned_prefixes": ["K16_", "K17_", "K18_", "K19_", "K20_"],
+      "extract": {"strip_components": 0}
+    },
+    {
+      "id": "keyframes-l21-l25",
+      "kind": "tar",
+      "remote_path": "data/keyframe_archives_v2/keyframes-L21-L25.tar",
+      "target": "data/keyframes",
+      "expected_size_bytes": null,
+      "checksum": {"algorithm": "md5", "value": null, "source": "rclone_remote_metadata", "required": true},
+      "owned_prefixes": ["L21_", "L22_", "L23_", "L24_", "L25_"],
+      "extract": {"strip_components": 0}
+    },
+    {
+      "id": "keyframes-l26-l30",
+      "kind": "tar",
+      "remote_path": "data/keyframe_archives_v2/keyframes-L26-L30.tar",
+      "target": "data/keyframes",
+      "expected_size_bytes": null,
+      "checksum": {"algorithm": "md5", "value": null, "source": "rclone_remote_metadata", "required": true},
+      "owned_prefixes": ["L26_", "L27_", "L28_", "L29_", "L30_"],
+      "extract": {"strip_components": 0}
+    }
+  ]
+}

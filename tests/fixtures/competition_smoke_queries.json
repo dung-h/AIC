@@ -1,0 +1,11 @@
+{
+  "queries": [
+    {
+      "query_id": "local-smoke-1",
+      "task": "qa",
+      "query": "A television program shows a presenter in a studio.",
+      "question": "Who or what is visible in the scene?",
+      "question_type": "person"
+    }
+  ]
+}

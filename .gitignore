@@ -1,0 +1,83 @@
+.env
+
+# Private corpus, review/holdout evidence and generated runtime artifacts.
+# Public source carries no query/answer annotations or experiment output.
+data/
+action_pack_v1_user_confirmed.json
+models/
+*.npy
+__pycache__/
+.venv/
+*.pyc
+.pytest_cache/
+.codex/
+dist/
+tmp/
+inspect_crops/
+eda_out/
+AIC-HCMC-2025-main/
+AIC-HCMC-2025-main.zip
+research/VBS-Archive/
+t.log
+
+# Private/generated experiment artifacts
+results/
+research/
+docs/archive/
+*.log
+
+# Private project-management notes and historical metric reports.  The public
+# release guide is README.md plus the allow-listed operational docs below.
+AGENTS.md
+ARCHITECTURE_STATUS.md
+BACKLOG.md
+COMPETITION_RUNBOOK.md
+DATA_ANALYSIS.md
+FINDINGS.md
+INSTALL_SUMMARY.md
+PLAN_NEXT.md
+PROGRESS.md
+RESEARCH_DIRECTION.md
+STRATEGY.md
+docs/*
+!docs/ARCHITECTURE_MODEL_AGNOSTIC.md
+!docs/ASR_GLOBAL_V2.md
+!docs/DEPLOYMENT_ASSETS.md
+!docs/OCR_GLOBAL_V2.md
+!docs/POLICY_OWNERSHIP.md
+!docs/PRODUCTION_FLOW_CONTRACTS.md
+
+# Only operational scripts belong in the public handoff.
+scripts/*
+!scripts/README.md
+!scripts/build_source_bundle.sh
+!scripts/competition.sh
+!scripts/competition_preflight.sh
+!scripts/runtime_data_bootstrap.py
+!scripts/wsl_python.sh
+
+# IDE/local workspace state
+.kiro/
+.vscode/
+.idea/
+
+# The public release keeps only guarded production materializers from eval.
+src/eda/
+src/queryset/
+src/tests/
+src/eval/*
+!src/eval/__init__.py
+!src/eval/asr_global_v2.py
+!src/eval/asr_global_merge_v2.py
+!src/eval/ocr_global_v2.py
+
+# Superseded, workstation-bound index builders.  The portable canonical
+# builder and encode_full_index.py are the supported rebuild boundary.
+src/utils/build_global_index.py
+src/utils/build_global_index_vitl.py
+src/utils/build_k_idmap.py
+src/encode/ab_visual_encoder.py
+configs/vqa_eval_manifest.yaml
+
+# Accidental Windows-path cache directories created under WSL/Linux
+D:\\HCMAI\\data\\cache/

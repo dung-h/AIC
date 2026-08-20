@@ -1,0 +1,24 @@
+{
+  "queries": [
+    {
+      "query_id": "kis-smoke-1",
+      "task": "kis",
+      "query": "A television program shows a presenter in a studio."
+    },
+    {
+      "query_id": "qa-smoke-1",
+      "task": "qa",
+      "query": "A television program shows a presenter in a studio.",
+      "question": "Who or what is visible in the scene?",
+      "question_type": "person"
+    },
+    {
+      "query_id": "trake-smoke-1",
+      "task": "trake",
+      "events": [
+        "a presenter appears in a television studio",
+        "the studio scene continues with the presenter"
+      ]
+    }
+  ]
+}

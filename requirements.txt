@@ -1,0 +1,83 @@
+# ============================================================================
+# HCMAI 2026 — Video Event Retrieval — Python dependencies
+# ----------------------------------------------------------------------------
+# Python 3.12 recommended.
+#
+# Install:
+#   python -m venv .venv
+#   .venv\Scripts\activate            (Windows)
+#   source .venv/bin/activate         (Linux/macOS/WSL)
+#   python -m pip install -U pip
+#   python -m pip install -r requirements.txt
+#
+# GPU note: install the CUDA build of torch FIRST if you have an NVIDIA GPU.
+# RTX 50-series / Blackwell needs CUDA 12.8+ wheels. Verified on RTX 5070 Ti:
+#   pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Then run this file (the torch line below becomes a no-op if already satisfied).
+# ============================================================================
+
+# ---- Core numerics / data ----
+numpy>=2.0
+pandas>=2.0
+pyarrow>=15
+
+# ---- Deep learning + visual encoder (REQUIRED for retrieval) ----
+# ViT-L-16-SigLIP2 via open_clip; CLIP baseline; VKIS image/clip encoding.
+torch>=2.6
+torchvision>=0.21
+open_clip_torch>=3.3
+
+# ---- Vector search ----
+faiss-cpu>=1.13
+
+# ---- Image I/O ----
+pillow>=11
+
+# ---- Web UI / API server (Competition Console) ----
+fastapi>=0.115
+uvicorn>=0.34
+python-multipart>=0.0.9          # required by FastAPI for multipart/file upload (VKIS)
+openai>=1.0                      # OpenAI-compatible answer provider; API is explicit opt-in
+
+# ---- Text embedding / NLP ----
+# transformers: M2M100 (VN->EN translate), Whisper/PhoWhisper (offline ASR fallback).
+transformers>=4.44
+sentencepiece>=0.2               # tokenizer backend for M2M100
+# sentence-transformers: offline bge-m3 text embedding (22x faster than API, finals-safe).
+sentence-transformers>=3.0
+
+# ---- Lexical retrieval (OCR / ASR BM25 channel) ----
+rank-bm25>=0.2.2
+
+# ---- Scientific / stats (router z-score, CSLS, EDA) ----
+scipy>=1.13
+scikit-learn>=1.5
+
+# ---- Caching + progress ----
+diskcache>=5.6                   # persistent cache layer (src/core/cache.py)
+tqdm>=4.66
+
+# ---- Tests ----
+pytest>=8.0
+pytest-timeout>=2.3
+
+# ============================================================================
+# OPTIONAL — install only if you need the corresponding feature.
+# These are heavy / platform-specific; not required for the core KIS pipeline.
+# ============================================================================
+
+# ---- Offline Vietnamese OCR (finals fallback when internet/API banned) ----
+# paddleocr also pulls paddlepaddle (large). Uncomment to enable.
+# paddleocr>=2.7
+# paddlepaddle>=2.6
+
+# ---- Video frame extraction for VKIS clip queries ----
+# opencv-python>=4.10
+
+# ---- Local 4-bit VLM reranking (optional; tested with Qwen2.5-VL-7B) ----
+bitsandbytes>=0.49
+accelerate>=1.0                 # device placement for local Qwen-VL materializers
+qwen-vl-utils>=0.0.10           # image/video preprocessing required by Qwen2.5-VL
+
+# ---- QUEST external image search (out-of-knowledge entities) ----
+# ddgs>=9.0
