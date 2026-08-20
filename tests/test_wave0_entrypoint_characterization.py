@@ -1,7 +1,7 @@
 """Wave 0 characterization for public entrypoint ownership.
 
-These tests intentionally describe the Wave 1 ownership contract: Web UI,
-service, and Codabench must delegate task execution through public
+These tests intentionally describe the production ownership contract: service
+and Codabench must delegate task execution through public
 ``HCMAIPipeline`` methods.  The fakes keep the tests independent of models,
 indexes, network access, and the real submission data.
 
@@ -10,7 +10,6 @@ still reaches a private child pipeline or legacy public method directly.
 """
 from __future__ import annotations
 
-import asyncio
 import sys
 import types
 from pathlib import Path
@@ -126,35 +125,6 @@ class _FakePipeline:
 
 def _method_names(fake_pipeline):
     return [call[0] for call in fake_pipeline.calls]
-
-
-def test_web_ui_vqa_uses_the_public_ranked_pipeline(monkeypatch):
-    """Interactive UI must share the public ranked Q&A owner."""
-    from src.pipelines import web_ui
-
-    _FakePipeline.instances.clear()
-    fake = _FakePipeline()
-    monkeypatch.setattr(web_ui, "get_pipe", lambda: fake)
-
-    asyncio.run(web_ui.api_vqa({
-        "query": "weather report",
-        "question": "What temperature is mentioned?",
-        "mode": "interactive",
-    }))
-
-    assert _method_names(fake) == ["vqa_ranked"]
-
-
-def test_web_ui_trake_uses_the_public_pipeline(monkeypatch):
-    from src.pipelines import web_ui
-
-    _FakePipeline.instances.clear()
-    fake = _FakePipeline()
-    monkeypatch.setattr(web_ui, "get_pipe", lambda: fake)
-
-    asyncio.run(web_ui.api_trake({"events": ["first event"]}))
-
-    assert _method_names(fake) == ["trake"]
 
 
 def test_service_vqa_delegates_to_hcmai_public_method(monkeypatch):

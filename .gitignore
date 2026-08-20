@@ -103,6 +103,27 @@ tests/test_wsl_runtime_preflight.py
 # routes explicitly when that workspace is absent.
 src/service/annotation_review.py
 
+# Retired 2025/research helpers. They have no caller in the competition
+# spine; keeping them locally preserves experiment history without exposing
+# remote/implicit fallback paths as deployable production capabilities.
+src/core/external_image_search.py
+src/core/hint_accumulator.py
+src/core/jina_clip_research.py
+src/core/query_rewriter.py
+src/core/registry.py
+src/core/reranker.py
+src/pipelines/kis_multistage.py
+src/pipelines/kis_retriever.py
+
+# The retired browser UI owns an independent KIS stack. The supported
+# interactive surface is src/service/ over HCMAIPipeline, so this cluster is
+# kept only in the local research workspace.
+src/pipelines/hybrid_search.py
+src/pipelines/object_search.py
+src/pipelines/query_expansion.py
+src/pipelines/temporal_nav.py
+src/pipelines/web_ui.py
+
 # Only operational scripts belong in the public handoff.
 scripts/*
 !scripts/README.md

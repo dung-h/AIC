@@ -1,7 +1,5 @@
-"""Wave 1 contract: service and Web UI share HCMAIPipeline public owners."""
+"""Wave 1 contract: service uses HCMAIPipeline public owners."""
 from __future__ import annotations
-
-import asyncio
 
 from src.runtime_policy import RuntimePolicy
 
@@ -102,50 +100,3 @@ def test_service_trake_delegates_to_public_hcmai_method(monkeypatch):
     assert fake.calls[0][2] == {"topk": 3}
     assert len(result["results"][0]["path"]) == 2
     assert runtime.last_trace == {"owner": "trake"}
-
-
-def test_web_ui_interactive_projection_uses_ranked_public_method(monkeypatch):
-    from src.pipelines import web_ui
-
-    _FakePipeline.instances.clear()
-    fake = _FakePipeline()
-    monkeypatch.setattr(web_ui, "get_pipe", lambda: fake)
-
-    result = asyncio.run(web_ui.api_vqa({
-        "query": "weather report",
-        "question": "What temperature is mentioned?",
-        "mode": "interactive",
-    }))
-
-    assert [call[0] for call in fake.calls] == ["vqa_ranked"]
-    assert result == {
-        "mode": "interactive",
-        "best": {
-            "video": "V1",
-            "frame_idx": 42,
-            "kf_n": 7,
-            "pts_time": 1.5,
-            "answer": "25 degrees",
-            "vlm_score": 0.9,
-        },
-    }
-
-
-def test_web_ui_ranked_response_shape_remains_stable(monkeypatch):
-    from src.pipelines import web_ui
-
-    _FakePipeline.instances.clear()
-    fake = _FakePipeline()
-    monkeypatch.setattr(web_ui, "get_pipe", lambda: fake)
-
-    result = asyncio.run(web_ui.api_vqa({
-        "query": "weather report",
-        "question": "What temperature is mentioned?",
-        "mode": "ranked",
-    }))
-
-    assert [call[0] for call in fake.calls] == ["vqa_ranked"]
-    assert result["mode"] == "ranked"
-    assert result["winner"] == "ranked"
-    assert result["status"] == "answered_local"
-    assert result["answers"][0]["frame_id"] == 42

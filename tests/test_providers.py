@@ -37,24 +37,12 @@ def test_embedding_requires_its_own_capability():
     assert not provider.configured
 
 
-def test_remote_helpers_fail_closed_without_their_role_provider(monkeypatch):
-    from src.core import offline_fallback, query_rewriter, reranker
+def test_remote_embedding_helper_fails_closed_without_its_role_provider(monkeypatch):
+    from src.core import offline_fallback
     from src.core.providers import ProviderConfig
 
     missing = ProviderConfig("missing", "", "", "")
-    monkeypatch.setattr(query_rewriter, "provider_for", lambda _role: missing)
-    monkeypatch.setattr(reranker, "provider_for", lambda _role: missing)
     monkeypatch.setattr(offline_fallback, "provider_for", lambda _role: missing)
 
-    with pytest.raises(RuntimeError, match="TEXT_BASE_URL"):
-        query_rewriter._llm([{"role": "user", "content": "rewrite"}])
-    with pytest.raises(RuntimeError, match="VLM_BASE_URL"):
-        reranker._vlm_visual_score("image", "scene")
     with pytest.raises(RuntimeError, match="EMBEDDING_BASE_URL"):
         offline_fallback.TextEmbedderOnline()
-
-
-def test_query_expansion_has_no_implicit_remote_fallback():
-    from src.pipelines.query_expansion import generate_variants
-
-    assert generate_variants("một cảnh quay", env={}) == ["một cảnh quay"]

@@ -134,6 +134,22 @@ class ModalityIndexRegistryTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["asr_observed_video_count"], 2)
         self.assertEqual(report["asr"][0]["no_speech_videos"], ["K01_V002"])
 
+    def test_strict_router_refuses_legacy_shards_without_global_manifest(self):
+        """Production routing must not silently substitute per-pack indexes."""
+        with tempfile.TemporaryDirectory() as directory:
+            router = QNAModalityRouter.__new__(QNAModalityRouter)
+            router.index_dir = Path(directory)
+            router.registry = ModalityIndexRegistry(router.index_dir)
+            router.strict = True
+            router.text_mode = "dense"
+            router._indexes = {}
+            router.expected_packs = ("k01",)
+
+            with self.assertRaisesRegex(RuntimeError, "global ASR manifest"):
+                router._load("asr")
+            with self.assertRaisesRegex(RuntimeError, "global OCR manifest"):
+                router._load("ocr")
+
 
 if __name__ == "__main__":
     unittest.main()

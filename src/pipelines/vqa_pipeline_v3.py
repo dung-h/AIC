@@ -618,7 +618,7 @@ class VQAPipelineV3:
         if not res:
             return {"answer": None, "error": "no retrieval"}
 
-        # KISRetriever results: (video_id, frame_idx, kf_n, score)
+        # KISFusionRetriever results: (video_id, frame_idx, kf_n, score)
         candidate_rows = res[:n_retrieve]
         if frames_per_video > 1:
             candidate_rows = self._local_candidates(

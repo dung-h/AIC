@@ -48,7 +48,6 @@ class HCMAIPipeline:
         self._trake_visual = None
         self._trake_multimodal = None
         self._trake_multimodal_retrievers = trake_multimodal_retrievers
-        self._quest = None
         base_policy = RuntimePolicy.from_env() if policy is None else policy
         if not isinstance(base_policy, RuntimePolicy):
             raise TypeError("policy must be a RuntimePolicy instance")
@@ -137,15 +136,6 @@ class HCMAIPipeline:
             trace.decision(decision)
         trace.finish()
         return trace.to_dict()
-
-    def _ensure_quest(self):
-        if self._quest is None:
-            sys.path.insert(0, os.path.join(ROOT, "..", "core"))
-            from external_image_search import ExternalImageSearch
-            # Reuse VKIS pipeline (shares SigLIP2 + global index)
-            self._quest = ExternalImageSearch(vkis_pipeline=self._ensure_vkis(),
-                                              backend="ddg")
-        return self._quest
 
     def _ensure_kis(self):
         if self._kis is None:
@@ -731,37 +721,6 @@ class HCMAIPipeline:
         trace.event("error", error_type=type(error).__name__, message=str(error))
         trace.finish()
         raise error
-
-    def kis_ook(self, query, topk=10, max_ref_images=5):
-        """KIS for Out-Of-Knowledge entities (QUEST): external image search →
-        image-to-image retrieval. Dùng khi entity lạ (tên riêng/sản phẩm/sự kiện mới)
-        mà text/visual embed không biết.
-        """
-        q = self._ensure_quest()
-        results, meta = q.search_by_entity(query, topk=topk, max_ref_images=max_ref_images)
-        return {"task": "KIS_OOK", "results": results, "meta": meta}
-
-    def kis_auto(self, query, topk=10, ook_threshold=None):
-        """KIS với fallback OOK: chạy KIS thường, nếu confidence thấp → QUEST.
-        ook_threshold: optional calibrated score-margin threshold. Disabled by
-        default because fused z-score margins are not calibrated confidence.
-        """
-        p = self._ensure_kis()
-        results = p.search(query, topk=topk)
-        # KISFusionRetriever returns ranked tuples, not the legacy router's
-        # (winner, confidence, results) triple. Use score margin only as a
-        # conservative OOK trigger; do not claim calibrated confidence.
-        scores = [float(row[3]) for row in results]
-        margin = scores[0] - scores[1] if len(scores) > 1 else 0.0
-        if ook_threshold is not None and results and margin < ook_threshold:
-            ook = self.kis_ook(query, topk=topk)
-            if ook["results"]:
-                return {"task": "KIS_AUTO", "winner": "ook_fallback",
-                        "results": ook["results"], "base_conf": margin,
-                        "ook_meta": ook["meta"]}
-        return {"task": "KIS_AUTO", "winner": "visual_fusion_vitl_so400m384",
-                "results": results, "base_conf": margin}
-
 
 if __name__ == "__main__":
     import json

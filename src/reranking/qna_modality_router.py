@@ -100,9 +100,11 @@ class QNAModalityRouter:
         if modality == "asr":
             # A present global source is authoritative.  Never silently
             # downgrade to root shards when it is malformed or incomplete.
-            # Non-strict callers can still use legacy shards when no global
-            # source has been materialized (diagnostic compatibility only).
-            if registry.discover_global_asr() is not None:
+            # Strict (production) routing also requires the global manifest:
+            # per-pack shards are diagnostic artifacts, never a substitute
+            # for a corpus-level ASR retrieval contract.
+            global_source = registry.discover_global_asr()
+            if global_source is not None:
                 try:
                     global_emb, global_meta, global_info = registry.load_asr(
                         expected_packs=getattr(self, "expected_packs", None),
@@ -124,6 +126,11 @@ class QNAModalityRouter:
                     global_emb = _normalise_rows(global_emb)
                 self._indexes[modality] = (global_emb, global_meta)
                 return self._indexes[modality]
+            if self.strict:
+                raise RuntimeError(
+                    "strict ASR routing requires a ready global ASR manifest; "
+                    "legacy per-pack shards are diagnostic-only"
+                )
         if modality == "ocr" and registry.discover_global_ocr() is not None:
             try:
                 global_emb, global_meta, global_info = registry.load_ocr(
@@ -144,6 +151,11 @@ class QNAModalityRouter:
                 global_emb = _normalise_rows(global_emb)
             self._indexes[modality] = (global_emb, global_meta)
             return self._indexes[modality]
+        if modality == "ocr" and self.strict:
+            raise RuntimeError(
+                "strict OCR routing requires a ready global OCR manifest; "
+                "legacy per-pack shards are diagnostic-only"
+            )
         features: list[np.ndarray] = []
         metadata: list[pd.DataFrame] = []
         offset = 0
