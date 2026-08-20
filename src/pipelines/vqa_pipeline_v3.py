@@ -17,7 +17,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "..", "utils"))
 from kis_fusion_retriever import KISFusionRetriever
-from paths import KEYFRAMES_DIR, INDEX_DIR, load_env
+from paths import KEYFRAMES_DIR, INDEX_DIR
 from src.core.providers import provider_for
 from src.reranking.query_routing_policy import (
     RoutingConfig,
@@ -43,8 +43,7 @@ from src.vqa.selector import (
     stage_record,
 )
 
-ENV = load_env()
-VLM_PROVIDER = provider_for("vision", ENV)
+VLM_PROVIDER = provider_for("vision")
 KEY = VLM_PROVIDER.api_key
 BASE = VLM_PROVIDER.base_url
 KF_DIR = str(KEYFRAMES_DIR)

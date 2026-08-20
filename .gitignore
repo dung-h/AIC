@@ -54,6 +54,7 @@ scripts/*
 !scripts/competition.sh
 !scripts/competition_preflight.sh
 !scripts/runtime_data_bootstrap.py
+!scripts/runtime_env.sh
 !scripts/wsl_python.sh
 
 # IDE/local workspace state
@@ -78,6 +79,23 @@ src/utils/build_global_index_vitl.py
 src/utils/build_k_idmap.py
 src/encode/ab_visual_encoder.py
 configs/vqa_eval_manifest.yaml
+
+# Historical workstation-only materializers.  They remain locally recoverable
+# but are intentionally excluded from the portable source release; supported
+# rebuild paths live under src/indexing/, src/encode/, src/eval/*_global_v2.py
+# and src/utils/ocr_local_pipeline.py.
+src/utils/asr_full_pipeline.py
+src/utils/batch_translate_vbs.py
+src/utils/cache_asr_embed_pack.py
+src/utils/cache_q_embed_pack.py
+src/utils/deepgram_pack.py
+src/utils/embed_ocr_pack.py
+src/utils/extract_keyframes_pack.py
+src/utils/index_summary.py
+src/utils/ocr_pack.py
+src/utils/ocr_pack_v2.py
+src/utils/rebuild_asr_chunks_pack.py
+src/utils/verify_zips.py
 
 # Accidental Windows-path cache directories created under WSL/Linux
 D:\\HCMAI\\data\\cache/

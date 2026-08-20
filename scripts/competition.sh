@@ -2,6 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "${repo_root}/scripts/runtime_env.sh"
+hcmai_load_dotenv "${HCMAI_DOTENV:-${repo_root}/.env}"
 
 # Resolve the runtime at the deployment boundary.  The old default pointed
 # at one workstation's home directory, which made a source bundle fail on a

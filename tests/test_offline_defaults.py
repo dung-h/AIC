@@ -143,10 +143,11 @@ class OfflineDefaultsTests(unittest.TestCase):
 
     def test_kis_remote_translation_fails_closed_without_credentials(self):
         from src.pipelines.kis_fusion_retriever import KISFusionRetriever
+        from src.core.providers import ProviderConfig
 
         obj = object.__new__(KISFusionRetriever)
         obj.translate_on = True
-        obj.env = {}
+        obj.text_provider = ProviderConfig("text", "", "", "")
         obj._translate_cache = {}
         with self.assertRaises(RuntimeError):
             obj.translate("một cảnh")
@@ -172,8 +173,12 @@ class OfflineDefaultsTests(unittest.TestCase):
 
     def test_trake_remote_mode_requires_credentials(self):
         from src.pipelines import trake_pipeline
+        from src.core.providers import ProviderConfig
 
-        with patch.object(trake_pipeline, "load_env", return_value={}):
+        with patch.object(
+            trake_pipeline, "provider_for",
+            return_value=ProviderConfig("embedding", "", "", ""),
+        ):
             with self.assertRaises(RuntimeError):
                 trake_pipeline.TrakePipeline(online=True)
 

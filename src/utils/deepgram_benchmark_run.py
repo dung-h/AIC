@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -22,17 +21,15 @@ from src.utils.deepgram_benchmark_crawl import (
     DEEPGRAM_ENDPOINT,
     DEEPGRAM_LANGUAGE,
     DEEPGRAM_MODEL,
-    _read_dotenv,
 )
+from src.utils.paths import load_runtime_env
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def _key() -> str:
-    value = os.environ.get("DEEPGRAM_API_KEY", "").strip()
-    if not value:
-        value = _read_dotenv(ROOT).get("DEEPGRAM_API_KEY", "").strip()
+    value = load_runtime_env(ROOT / ".env").get("DEEPGRAM_API_KEY", "").strip()
     if not value:
         raise RuntimeError("DEEPGRAM_API_KEY is not configured")
     return value

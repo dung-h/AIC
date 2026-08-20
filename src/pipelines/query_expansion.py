@@ -7,7 +7,7 @@ Strategy (RAPID-style, LSC 2024 measured +15-20% Top-10 recall):
 3. Results fused via Reciprocal Rank Fusion (RRF, k=60)
 4. Original query anchor is always included (prevents hallucination drift)
 
-API: llama-4-maverick (vision-capable, 1.6s/call, avoids llama3.3-70b rate limit)
+API: an explicitly configured text-capable OpenAI-compatible provider
 Fallback: return [original_query] when API unavailable
 """
 import json
@@ -19,7 +19,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Optional, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
-from paths import load_env
+from paths import load_runtime_env
+from src.core.providers import provider_for
 
 
 # ---------------------------------------------------------------------------
@@ -33,39 +34,38 @@ Result = Tuple[str, int, float, float]
 # LLM helpers
 # ---------------------------------------------------------------------------
 def _load_env(path: str | None = None) -> dict:
-    return load_env(path)
+    return load_runtime_env(path)
 
 
 def _llm_call(
     prompt: str,
     env: dict,
-    model: str = "llama-4-maverick",
+    model: str | None = None,
     max_tokens: int = 300,
     temperature: float = 0.7,
     retries: int = 2,
 ) -> Optional[str]:
     """
-    Call DigitalOcean inference API (OpenAI-compatible).
+    Call the configured text API (OpenAI-compatible).
 
     Returns raw text content or None on failure.
     """
-    key = env.get("DO_INFERENCE_KEY")
-    base = env.get("DO_INFERENCE_BASE", "https://inference.do-ai.run/v1")
-    if not key:
+    provider = provider_for("text", env)
+    if not provider.configured:
         return None
 
     payload = {
-        "model": model,
+        "model": model or provider.model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    url = base.rstrip("/") + "/chat/completions"
+    url = provider.base_url + "/chat/completions"
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
         headers={
-            "Authorization": f"Bearer {key}",
+            "Authorization": f"Bearer {provider.api_key}",
             "Content-Type": "application/json",
         },
     )
@@ -111,7 +111,7 @@ def generate_variants(
     query: str,
     n: int = 3,
     env: Optional[dict] = None,
-    model: str = "llama-4-maverick",
+    model: str | None = None,
 ) -> List[str]:
     """
     Generate N visual description variants using LLM.
@@ -203,7 +203,7 @@ def expand_and_search(
     n_variants: int = 3,
     topk: int = 20,
     env: Optional[dict] = None,
-    model: str = "llama-4-maverick",
+    model: str | None = None,
     max_workers: int = 4,
 ) -> dict:
     """

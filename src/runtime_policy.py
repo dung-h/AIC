@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.utils.paths import activate_runtime_env
+
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -179,6 +181,9 @@ class RuntimePolicy:
     @classmethod
     def from_env(cls) -> "RuntimePolicy":
         """Build the process default exactly once at an entrypoint boundary."""
+        # Make `.env` available to every policy-driven entrypoint while keeping
+        # an explicitly exported value authoritative over the local file.
+        activate_runtime_env()
         project_root = Path(__file__).resolve().parents[1]
         execution_mode = _env_choice(
             "HCMAI_EXECUTION_MODE",

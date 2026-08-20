@@ -38,8 +38,9 @@ shared Drive folder. Recreate `.venv` from `requirements.txt`; do not transfer
 the Windows/WSL virtual environment. On WSL, place the environment in the Linux
 filesystem (for example under `$HOME/.venvs`) rather than `/mnt/c`: cold
 `sentence_transformers` imports on the NTFS mount can take more than 180s.
-The current workstation's authoritative interpreter is
-`/home/user1/hcmai-venv/bin/python`.
+Use `.env.example` as the single configuration schema: explicit OS variables
+override `.env`, and `.env` overrides code defaults for both Python and Bash
+entrypoints.
 
 Optional/rebuild-only assets include `tmp/deepgram_audio/`, old per-pack ASR/OCR
 intermediates, the 3B Qwen model, Jina experimental weights, diagnostic crops,

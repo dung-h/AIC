@@ -80,8 +80,24 @@ export HF_HUB_CACHE=/opt/models/huggingface/hub
 export HCMAI_RUNTIME_REMOTE='gdrive:HCMAI-2026/runtime'
 ```
 
-Copy `.env.example` to a private `.env` only if API providers are used. Never
-commit the resulting file.
+## Configuration contract
+
+Copy `.env.example` to a private `.env` when this server needs local path
+overrides or an explicit remote provider. Never commit the resulting file.
+Every supported Python entrypoint and Bash wrapper reads the same safe
+`KEY=VALUE` format; exported environment variables override `.env`, which in
+turn overrides code defaults. `.env` is never sourced as shell code.
+
+```bash
+cp .env.example .env
+# Edit only the fields this server needs; keep API keys private.
+```
+
+Remote capabilities are role-separated: `TEXT_*` for rewriting, `VLM_*` for
+image-aware answering/reranking, and `EMBEDDING_*` for remote text embeddings.
+The offline competition default needs no API key. Legacy `DO_*` vision names
+are read only as a migration alias at the configuration boundary; new
+deployments must use the role-specific keys in `.env.example`.
 
 Configure a personal/team `rclone` remote named `gdrive`, then inspect the
 local state first. `plan` makes no network call. `fetch --yes` is explicit,

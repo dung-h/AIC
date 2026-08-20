@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.join(ROOT, "..", "core"))
 from dante import dante_align
 from cache import get_cache
 from offline_fallback import get_text_embedder
-from paths import INDEX_DIR, load_env
+from paths import INDEX_DIR
+from src.core.providers import provider_for
 from src.utils.open_clip_local import get_tokenizer as get_local_tokenizer
 try:
     from src.trake.contracts import (
@@ -85,11 +86,11 @@ class TrakePipeline:
             return
 
         if online:
-            env = load_env()
-            if not env.get("DO_INFERENCE_KEY") or not env.get("DO_INFERENCE_BASE"):
+            provider = provider_for("embedding")
+            if not provider.configured:
                 raise RuntimeError(
                     "Remote TRAKE text embedding is explicitly enabled but "
-                    "DO_INFERENCE_KEY and/or DO_INFERENCE_BASE is missing; "
+                    "EMBEDDING_BASE_URL, EMBEDDING_API_KEY and/or EMBEDDING_MODEL is missing; "
                     "use online=False for offline mode"
                 )
         # The explicit ASR path has one source of truth.  Do not glob legacy

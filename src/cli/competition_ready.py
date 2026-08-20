@@ -23,8 +23,15 @@ import tempfile
 from typing import Any, Iterable, Sequence
 import zipfile
 
+from src.core.providers import provider_for
+from src.utils.paths import activate_runtime_env, load_runtime_env
+
 
 ROOT = Path(__file__).resolve().parents[2]
+# Preflight has environment-derived parser defaults, so activate the shared
+# dotenv contract before those defaults are constructed.  Explicit exports
+# remain authoritative.
+activate_runtime_env()
 DEFAULT_CANONICAL = ROOT / "data/index/global_keyframes.parquet"
 DEFAULT_KEYFRAMES = ROOT / "data/keyframes"
 DEFAULT_VISUAL_INDEXES = (
@@ -454,22 +461,6 @@ def _check_modality(builder: ReportBuilder, name: str, directory: Path, expected
         )
 
 
-def _dotenv_values(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    if not path.is_file():
-        return values
-    for raw in path.read_text(encoding="utf-8-sig").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, value = line.split("=", 1)
-        name = name.strip()
-        if name.startswith("export "):
-            name = name[7:].strip()
-        values[name] = value.strip().strip("'\"")
-    return values
-
-
 def _check_provider(builder: ReportBuilder, config: PreflightConfig) -> None:
     if config.provider == "local":
         path = config.local_model
@@ -506,16 +497,16 @@ def _check_provider(builder: ReportBuilder, config: PreflightConfig) -> None:
         )
         return
 
-    dotenv = _dotenv_values(config.dotenv_path or (config.project_root / ".env"))
-    values = {**dotenv, **os.environ}
-    dedicated = ("VLM_BASE_URL", "VLM_API_KEY", "VLM_MODEL")
-    legacy = ("DO_INFERENCE_BASE", "DO_INFERENCE_KEY", "DO_VLM_MODEL")
-    selected = dedicated if all(values.get(name, "").strip() for name in dedicated) else legacy
-    configured = all(values.get(name, "").strip() for name in selected)
+    dotenv_path = config.dotenv_path or (config.project_root / ".env")
+    provider = provider_for("vision", load_runtime_env(dotenv_path))
     builder.add(
-        "answer_provider", configured,
-        "Explicit OpenAI-compatible vision provider is configured" if configured else "API provider is missing endpoint, key, or model",
-        details={"provider": "openai", "configuration_variables": list(selected), "configured": configured},
+        "answer_provider", provider.configured,
+        "Explicit OpenAI-compatible vision provider is configured" if provider.configured else "API provider is missing VLM_BASE_URL, VLM_API_KEY, or VLM_MODEL",
+        details={
+            "provider": "openai",
+            "configuration_variables": ["VLM_BASE_URL", "VLM_API_KEY", "VLM_MODEL"],
+            "configured": provider.configured,
+        },
     )
 
 

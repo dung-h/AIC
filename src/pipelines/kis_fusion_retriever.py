@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
-from paths import INDEX_DIR, load_env  # noqa: E402
+from paths import INDEX_DIR  # noqa: E402
+from src.core.providers import provider_for  # noqa: E402
 from src.utils.open_clip_local import get_tokenizer as get_local_tokenizer  # noqa: E402
 
 
@@ -38,13 +39,12 @@ class KISFusionRetriever:
         self.open_clip = open_clip
         self.translate_on = translate
         self.alpha = alpha  # ViT-L weight; SO400M weight is 1-alpha
-        self.env = load_env()
+        self.text_provider = provider_for("text")
         self._translate_cache: dict = translate_cache or {}
-        if translate and (not self.env.get("DO_INFERENCE_KEY") or
-                          not self.env.get("DO_INFERENCE_BASE")):
+        if translate and not self.text_provider.configured:
             raise RuntimeError(
-                "Remote KIS translation is explicitly enabled but DO_INFERENCE_KEY "
-                "and/or DO_INFERENCE_BASE is missing; use translate=False for offline mode"
+                "Remote KIS translation is explicitly enabled but TEXT_BASE_URL, "
+                "TEXT_API_KEY and/or TEXT_MODEL is missing; use translate=False for offline mode"
             )
         self.dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.nllb_routing = bool(nllb_routing)
@@ -152,14 +152,13 @@ class KISFusionRetriever:
             return text
         if text in self._translate_cache:
             return self._translate_cache[text]
-        key = self.env.get("DO_INFERENCE_KEY")
-        base = self.env.get("DO_INFERENCE_BASE")
-        if not key or not base:
+        provider = self.text_provider
+        if not provider.configured:
             raise RuntimeError(
                 "Remote KIS translation is enabled but credentials are unavailable"
             )
         payload = {
-            "model": "llama-4-maverick",
+            "model": provider.model,
             "messages": [{"role": "user", "content":
                 "Translate this Vietnamese visual scene description to a concise English image caption "
                 "(keep all visual details). Output ONLY the caption:\n\n" + text}],
@@ -167,9 +166,9 @@ class KISFusionRetriever:
             "temperature": 0.0,
         }
         req = urllib.request.Request(
-            base.rstrip("/") + "/chat/completions",
+            provider.base_url + "/chat/completions",
             data=json.dumps(payload).encode(),
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"},
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as r:

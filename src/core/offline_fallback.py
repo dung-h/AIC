@@ -14,7 +14,7 @@ Lazy-load: chỉ load model khi gọi lần đầu (nếu bạn KHÔNG dùng off
 import os, sys
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
-from paths import load_env
+from src.core.providers import provider_for
 
 
 class TextEmbedderOffline:
@@ -41,7 +41,7 @@ class TextEmbedderOffline:
 
 
 class TextEmbedderOnline:
-    """bge-m3 via DO API (current path). Same interface."""
+    """Text embedding via an explicit OpenAI-compatible embedding provider."""
 
     def __init__(self):
         from urllib.request import Request, urlopen
@@ -49,9 +49,15 @@ class TextEmbedderOnline:
         import json
         self.urlopen = urlopen; self.Request = Request
         self.HTTPError = HTTPError; self.json = json
-        env = load_env()
-        self.KEY = env.get("DO_INFERENCE_KEY", "")
-        self.BASE = env.get("DO_INFERENCE_BASE", "")
+        provider = provider_for("embedding")
+        if not provider.configured:
+            raise RuntimeError(
+                "online embeddings require EMBEDDING_BASE_URL, EMBEDDING_API_KEY "
+                "and EMBEDDING_MODEL"
+            )
+        self.KEY = provider.api_key
+        self.BASE = provider.base_url
+        self.MODEL = provider.model
 
     def embed(self, texts, batch_size=16, normalize=True):
         if isinstance(texts, str): texts = [texts]
@@ -59,7 +65,7 @@ class TextEmbedderOnline:
         import time
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i+batch_size]
-            pl = {"model": "bge-m3", "input": batch}
+            pl = {"model": self.MODEL, "input": batch}
             req = self.Request(self.BASE.rstrip("/") + "/embeddings",
                 data=self.json.dumps(pl).encode(),
                 headers={"Authorization": f"Bearer {self.KEY}",
@@ -86,7 +92,7 @@ def get_text_embedder(prefer="auto"):
     """
     prefer:
     - "auto": rejected because provider choice and fallback must be visible
-    - "online": only DO API
+    - "online": only the configured embedding API
     - "offline": only local
     """
     if prefer == "offline":

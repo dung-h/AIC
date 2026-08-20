@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+source "${PROJECT_ROOT}/scripts/runtime_env.sh"
+hcmai_load_dotenv "${HCMAI_DOTENV:-${PROJECT_ROOT}/.env}"
 
 if [[ -n "${HCMAI_PYTHON:-}" ]]; then
   PYTHON_BIN="${HCMAI_PYTHON}"

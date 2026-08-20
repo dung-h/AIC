@@ -6,6 +6,8 @@ set -euo pipefail
 # data, or indexes.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+source "${PROJECT_ROOT}/scripts/runtime_env.sh"
+hcmai_load_dotenv "${HCMAI_DOTENV:-${PROJECT_ROOT}/.env}"
 
 unset PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
 export PYTHONNOUSERSITE=1

@@ -14,19 +14,27 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "..", "utils"))
 from cache import get_cache
-from paths import load_env
-
-ENV = load_env(); KEY = ENV.get("DO_INFERENCE_KEY", ""); BASE = ENV.get("DO_INFERENCE_BASE", "")
+from src.core.providers import provider_for
 
 QUERY_CACHE = get_cache("query_rewrites", version="v1")
 
 
-def _llm(messages, model="llama3.3-70b-instruct", max_tokens=200, temperature=0.3):
-    pl = {"model": model, "messages": messages,
+def _llm(messages, model=None, max_tokens=200, temperature=0.3):
+    """Call the explicitly configured text provider.
+
+    Rewriting is an opt-in remote enhancement.  It must not borrow the VLM
+    endpoint or guess a DigitalOcean default when no text provider exists.
+    """
+    provider = provider_for("text")
+    if not provider.configured:
+        raise RuntimeError(
+            "text rewriting requires TEXT_BASE_URL, TEXT_API_KEY and TEXT_MODEL"
+        )
+    pl = {"model": model or provider.model, "messages": messages,
           "max_tokens": max_tokens, "temperature": temperature}
-    req = urllib.request.Request(BASE.rstrip("/") + "/chat/completions",
+    req = urllib.request.Request(provider.base_url + "/chat/completions",
         data=json.dumps(pl).encode(),
-        headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"})
+        headers={"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"})
     for a in range(5):
         try:
             with urllib.request.urlopen(req, timeout=60) as r:

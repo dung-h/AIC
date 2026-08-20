@@ -283,11 +283,10 @@ class HCMAIPipeline:
             )
         elif provider_name == "openai":
             from src.core.providers import provider_for
-            from paths import load_env
-            config = provider_for("vision", load_env())
-            if not config.base_url or not config.api_key:
+            config = provider_for("vision")
+            if not config.configured:
                 raise RuntimeError(
-                    "VQA_ANSWER_PROVIDER=openai requires a configured vision API base URL and key"
+                    "VQA_ANSWER_PROVIDER=openai requires VLM_BASE_URL, VLM_API_KEY and VLM_MODEL"
                 )
             provider = OpenAICompatibleAnswerProvider(
                 base_url=config.base_url,

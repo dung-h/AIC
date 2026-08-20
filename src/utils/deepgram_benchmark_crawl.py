@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
+from src.utils.paths import load_runtime_env
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT = ROOT / "data" / "annotations" / "vqa_eval_v3_1.jsonl"
@@ -71,30 +73,14 @@ class Target:
     last_error: str | None = None
 
 
-def _read_dotenv(root: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    env_file = root / ".env"
-    if not env_file.exists():
-        return values
-    for raw in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip("'\"")
-    return values
-
-
 def require_deepgram_key(env: Mapping[str, str] | None = None, root: Path = ROOT) -> None:
     """Fail closed when the key is not configured, without exposing it."""
 
-    supplied = env if env is not None else os.environ
+    supplied = dict(env) if env is not None else load_runtime_env(root / ".env")
     key = str(supplied.get("DEEPGRAM_API_KEY", "")).strip()
-    if not key and env is None:
-        key = _read_dotenv(root).get("DEEPGRAM_API_KEY", "").strip()
     if not key:
         raise CrawlConfigError(
-            "DEEPGRAM_API_KEY is required; set it in the environment or C:\\HCMAI\\.env"
+            "DEEPGRAM_API_KEY is required; set it in the environment or the project .env"
         )
 
 

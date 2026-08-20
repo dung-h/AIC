@@ -17,7 +17,8 @@ import numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "router"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
-from paths import INDEX_DIR, KEYFRAMES_DIR, load_env
+from paths import INDEX_DIR, KEYFRAMES_DIR
+from src.core.providers import provider_for
 from src.utils.open_clip_local import get_tokenizer as get_local_tokenizer
 
 
@@ -34,7 +35,8 @@ class KISRetriever:
         self.translate_on = translate
         self.use_csls = use_csls
         self.csls_beta = csls_beta
-        self.env = load_env()
+        self.text_provider = provider_for("text")
+        self.vision_provider = provider_for("vision")
         # Pre-translated cache: {vn_text: en_text} — avoids per-query API call
         self._translate_cache: dict = translate_cache or {}
 
@@ -63,17 +65,17 @@ class KISRetriever:
             return text
         if text in self._translate_cache:
             return self._translate_cache[text]
-        key = self.env.get("DO_INFERENCE_KEY"); base = self.env.get("DO_INFERENCE_BASE")
-        if not key:
+        provider = self.text_provider
+        if not provider.configured:
             return text
-        pl = {"model": "llama-4-maverick",
+        pl = {"model": provider.model,
               "messages": [{"role": "user", "content":
                   "Translate this Vietnamese visual scene description to a concise English "
                   "image caption (keep all visual details). Output ONLY the caption:\n\n" + text}],
               "max_tokens": 150, "temperature": 0.0}
-        req = urllib.request.Request(base.rstrip("/") + "/chat/completions",
+        req = urllib.request.Request(provider.base_url + "/chat/completions",
             data=json.dumps(pl).encode(),
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+            headers={"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.load(r)["choices"][0]["message"]["content"].strip()
@@ -109,12 +111,12 @@ class KISRetriever:
             results.append((v, int(best.frame_idx), int(best.kf_n), float(vid_sc[j])))
         return results
 
-    def vlm_score(self, desc_vn, img_path, model="llama-4-maverick"):
+    def vlm_score(self, desc_vn, img_path, model=None):
         """Chấm điểm khớp (desc, keyframe) bằng VLM. maverick: nhanh + đọc ảnh VN tốt
         (gemma-4-31B throttle nặng nên dùng maverick). Exp 112."""
         import base64, re
-        key = self.env.get("DO_INFERENCE_KEY"); base = self.env.get("DO_INFERENCE_BASE")
-        if not key:
+        provider = self.vision_provider
+        if not provider.configured:
             return 0.0
         try:
             b64 = base64.b64encode(open(img_path, "rb").read()).decode()
@@ -122,13 +124,13 @@ class KISRetriever:
             return 0.0
         prompt = (f"Mô tả cần tìm: \"{desc_vn}\"\n\nKhung hình này khớp mức nào? "
                   "Chỉ 1 số 0-10 (10=khớp hoàn hảo). CHỈ số.")
-        pl = {"model": model, "messages": [{"role": "user", "content": [
+        pl = {"model": model or provider.model, "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}],
             "max_tokens": 10, "temperature": 0.0}
-        req = urllib.request.Request(base.rstrip("/") + "/chat/completions",
+        req = urllib.request.Request(provider.base_url + "/chat/completions",
             data=json.dumps(pl).encode(),
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+            headers={"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"})
         for _ in range(3):
             try:
                 with urllib.request.urlopen(req, timeout=60) as rr:
