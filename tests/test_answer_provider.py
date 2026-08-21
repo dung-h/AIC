@@ -32,7 +32,10 @@ def _request(frame_path: Path) -> AnswerProviderRequest:
 
 
 def test_response_normalizes_empty_and_evidence_only_to_abstention():
-    for answer in ("", "unknown", "evidence-only", "I cannot answer from this evidence"):
+    for answer in (
+        "", "unknown", "evidence-only", "I cannot answer from this evidence",
+        "Không tìm thấy hai câu thơ nào.",
+    ):
         response = AnswerProviderResponse(
             candidate_id="candidate-1",
             answer=answer,

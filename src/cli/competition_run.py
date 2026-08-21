@@ -321,6 +321,7 @@ def run_competition(specs: list[QuerySpec], *, output: Path, answer_provider: st
                     modality_routing: bool, topk: int, max_vlm_candidates: int | None,
                     external_grounding: bool = False,
                     external_image_grounding: bool = False,
+                    enforce_query_evidence_contract: bool = False,
                     audit_output: Path | None = None) -> dict[str, Any]:
     # All retrieval/model artifacts are local even in the API answer profile.
     # This prevents sentence-transformers/transformers from probing the Hub;
@@ -372,10 +373,20 @@ def run_competition(specs: list[QuerySpec], *, output: Path, answer_provider: st
             entry = {"task": "kis", "query_id": spec.query_id, "answers": answers}
         elif spec.task == "qa":
             budget = max_vlm_candidates or COMPETITION_QA_VLM_CANDIDATES
+            # Portal queries do not include an official answer-modality
+            # annotation.  Locally added labels are useful routing hints but
+            # cannot become a hard verifier requirement: a place name can be
+            # visible in OCR while the ASR only identifies the programme.
+            # Benchmark evaluators call VQAPipelineV3 with reviewed labels
+            # directly; this competition entrypoint requires explicit opt-in
+            # before enforcing a JSON manifest's private metadata.
+            required_modalities = (
+                spec.required_modalities if enforce_query_evidence_contract else None
+            )
             result = pipe.vqa_ranked(
                 spec.query, spec.question, max_answers=min(topk, 20),
                 max_vlm_candidates=budget, question_type=spec.question_type,
-                required_modalities=spec.required_modalities,
+                required_modalities=required_modalities,
                 modality_routing=modality_routing,
                 offline=(
                     answer_provider == "local"
@@ -427,6 +438,7 @@ def run_competition(specs: list[QuerySpec], *, output: Path, answer_provider: st
         "modality_routing": modality_routing,
         "external_grounding": external_grounding,
         "external_image_grounding": external_image_grounding,
+        "query_evidence_contract_enforced": enforce_query_evidence_contract,
         "vqa_selector_policy": policy.vqa_visual_selector_policy,
         "max_vlm_candidates": (
             max_vlm_candidates or COMPETITION_QA_VLM_CANDIDATES
@@ -473,6 +485,12 @@ def main() -> None:
         help=("web images may seed local image-to-image retrieval for visual OOK "
               "entities; requires VQA_EXTERNAL_IMAGE_* configuration"),
     )
+    parser.add_argument(
+        "--enforce-query-evidence-contract", action=argparse.BooleanOptionalAction,
+        default=False,
+        help=("Treat required_modalities embedded in a JSON manifest as a hard "
+              "answer-verification contract; off by default for official portal queries"),
+    )
     parser.add_argument("--audit-output", type=Path, default=None)
     args = parser.parse_args()
     if not 1 <= args.topk <= 100:
@@ -486,6 +504,7 @@ def main() -> None:
         max_vlm_candidates=args.max_vlm_candidates,
         external_grounding=args.external_grounding,
         external_image_grounding=args.external_image_grounding,
+        enforce_query_evidence_contract=args.enforce_query_evidence_contract,
         audit_output=args.audit_output,
     )
     print(json.dumps({key: report[key] for key in (

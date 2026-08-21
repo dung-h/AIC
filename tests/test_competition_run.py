@@ -182,6 +182,10 @@ def test_mixed_runner_openai_profile_allows_only_vlm_network_and_uses_policy_tra
     )]
     assert os.environ["HF_HUB_OFFLINE"] == "1"
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+    # Portal manifests have no reviewed answer-modality contract.  A local
+    # routing label may guide retrieval, but it must not reject an answer
+    # merely because its literal text is absent from one specialist channel.
+    assert calls[0]["required_modalities"] is None
     with zipfile.ZipFile(output) as bundle:
         assert set(bundle.namelist()) == {
             "submission/", "submission/query-1-kis.csv",
@@ -191,6 +195,48 @@ def test_mixed_runner_openai_profile_allows_only_vlm_network_and_uses_policy_tra
             bundle.read("submission/query-2-qa.csv").decode("utf-8")
         )))
         assert rows == [["V1", "20", "25°C"]]
+
+
+def test_runner_only_enforces_manifest_evidence_contract_when_requested(
+        monkeypatch, tmp_path):
+    calls = []
+
+    class FakePipeline:
+        def __init__(self, policy):
+            self.policy = policy
+
+        def vqa_ranked(self, query, question, **kwargs):
+            calls.append(kwargs)
+            return {"answers": [{"video_id": "V1", "frame_id": 20, "answer": "Giang Ly"}]}
+
+    import src.pipelines.hcmai_pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "HCMAIPipeline", FakePipeline)
+    monkeypatch.setattr(
+        competition_run, "load_production_canonical_registry",
+        lambda: ({("V1", 20)}, {"sha256": "test"}),
+    )
+    monkeypatch.setattr(
+        competition_run.RuntimePolicy, "from_env",
+        classmethod(lambda cls: RuntimePolicy()),
+    )
+    spec = competition_run.QuerySpec(
+        "qa", "qa", query="FANA", question="Tên xã nào?",
+        question_type="spoken_fact", required_modalities=["asr"],
+    )
+
+    competition_run.run_competition(
+        [spec], output=tmp_path / "default.zip", answer_provider="local",
+        modality_routing=True, topk=1, max_vlm_candidates=1,
+    )
+    competition_run.run_competition(
+        [spec], output=tmp_path / "strict.zip", answer_provider="local",
+        modality_routing=True, topk=1, max_vlm_candidates=1,
+        enforce_query_evidence_contract=True,
+    )
+
+    assert calls[0]["required_modalities"] is None
+    assert calls[1]["required_modalities"] == ["asr"]
 
 
 def test_mixed_runner_local_profile_locks_all_network_features_off(monkeypatch, tmp_path):

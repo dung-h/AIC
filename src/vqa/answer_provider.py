@@ -87,6 +87,8 @@ _REFUSAL_PREFIXES = (
     "insufficient evidence",
     "không thể",
     "không đủ",
+    "không tìm thấy",
+    "khong tim thay",
 )
 
 

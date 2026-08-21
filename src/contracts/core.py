@@ -53,6 +53,8 @@ _PLACEHOLDER_ANSWERS = frozenset(
         "unavailable",
         "evidence-only",
         "evidence only",
+        "không tìm thấy",
+        "khong tim thay",
     }
 )
 

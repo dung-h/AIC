@@ -420,6 +420,7 @@ def answer_is_submission_safe(answer: Any) -> bool:
         "cannot determine", "cannot answer", "unable to answer",
         "insufficient evidence", "not enough information", "no information",
         "không đủ thông tin", "không thể trả lời", "không xác định",
+        "không tìm thấy", "khong tim thay",
     ))
 
 

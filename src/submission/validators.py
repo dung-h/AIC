@@ -13,6 +13,7 @@ _PLACEHOLDER_ANSWERS = {
     "placeholder", "no answer", "not available", "cannot answer", "can't answer",
     "không xác định", "không thể trả lời", "không đủ thông tin",
 }
+_PLACEHOLDER_PREFIXES = ("không tìm thấy", "khong tim thay")
 
 
 def _canonical_contains(canonical_frames: Any, video_id: str, frame_id: int) -> bool:
@@ -59,7 +60,8 @@ def validate_qna_answers(
         record = _record(raw, QnAAnswerRecord)
         if record.abstain:
             raise ValueError(f"Q&A rank {rank} is marked abstain")
-        if record.answer.strip().casefold() in _PLACEHOLDER_ANSWERS:
+        answer = record.answer.strip().casefold()
+        if answer in _PLACEHOLDER_ANSWERS or answer.startswith(_PLACEHOLDER_PREFIXES):
             raise ValueError(f"Q&A rank {rank} has an empty/placeholder answer")
         if not _canonical_contains(canonical_frames, record.video_id, record.frame_id):
             raise ValueError(f"Q&A rank {rank} has non-canonical frame: {record.video_id}/{record.frame_id}")

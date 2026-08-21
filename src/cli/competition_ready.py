@@ -777,7 +777,11 @@ def _validate_output_json(data: bytes, label: str, pairs: set[tuple[str, int]] |
                 identity = (str(answer.get("video_id")).strip().upper(), *parsed)
             else:
                 response = str(answer.get("answer", "")).strip()
-                if not response or response.casefold() in {"null", "unknown", "evidence-only", "placeholder"}:
+                if (
+                    not response
+                    or response.casefold() in {"null", "unknown", "evidence-only", "placeholder"}
+                    or response.casefold().startswith(("không tìm thấy", "khong tim thay"))
+                ):
                     raise ValueError(f"{label}: Q&A answer is empty/placeholder")
                 _canonical_answer(answer.get("video_id"), answer.get("frame_id"), pairs, label)
                 identity = (str(answer.get("video_id")).strip().upper(), int(answer.get("frame_id")))
@@ -866,6 +870,7 @@ def _validate_official_member(data: bytes, label: str, task: str,
             if (
                 not answer or len(answer) > 100
                 or answer.casefold() in {"null", "unknown", "evidence-only", "placeholder"}
+                or answer.casefold().startswith(("không tìm thấy", "khong tim thay"))
             ):
                 raise ValueError(f"{label}: Q&A row {rank} has an invalid answer")
             _canonical_answer(video_id, frame, pairs, label)

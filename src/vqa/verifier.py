@@ -34,6 +34,7 @@ _REFUSAL_PREFIXES = (
     "i cannot", "i can't", "cannot answer", "can't answer",
     "not enough evidence", "insufficient evidence", "unable to answer",
     "không thể", "không đủ",
+    "không tìm thấy", "khong tim thay",
 )
 _TOKEN_RE = re.compile(r"[\wÀ-ỹ]+", flags=re.UNICODE)
 _NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,]\d+)?(?!\w)")
