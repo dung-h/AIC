@@ -210,6 +210,32 @@ def infer_question_type(query, question):
     return "action"
 
 
+def _filter_to_active_videos(rows, active_video_ids):
+    """Keep every retrieval lane inside the installed visual corpus.
+
+    Text indexes may cover more packs than the keyframes deployed on a small
+    server.  Apply the same active-video boundary before RRF so an unavailable
+    ASR/OCR result cannot consume a ranked slot and disappear only at the
+    image-loading stage. Unknown row shapes are retained for the owning
+    validator to reject exactly as before.
+    """
+    allowed = {str(value) for value in active_video_ids or ()}
+    if not allowed:
+        return list(rows or ())
+    output = []
+    for row in rows or ():
+        if isinstance(row, dict):
+            video_id = row.get("video_id")
+        elif isinstance(row, (tuple, list)) and row:
+            video_id = row[0]
+        else:
+            output.append(row)
+            continue
+        if str(video_id) in allowed:
+            output.append(row)
+    return output
+
+
 class VQAPipelineV3:
     """VQA with VLM verify pre-answer, on the production KIS stack."""
 
@@ -225,6 +251,9 @@ class VQAPipelineV3:
         # open_clip or trigger a checkpoint/tokenizer download.
         self.kis = kis_retriever or KISFusionRetriever(translate=translate, alpha=0.4)
         self.km = self.kis.km
+        self._active_video_ids = frozenset(
+            str(video_id) for video_id in getattr(self.kis, "all_vids", ())
+        )
         self._asr = None  # lazy
         self._ocr = None  # lazy
         self._asr_by_video = None
@@ -1957,14 +1986,18 @@ class VQAPipelineV3:
                         )
                     )
             retrieval_fanout = run_retrieval_fanout(retrieval_tasks)
-            baseline_visual_retrieved = list(retrieval_fanout.results["visual"])
+            baseline_visual_retrieved = _filter_to_active_videos(
+                retrieval_fanout.results["visual"], self._active_video_ids
+            )
             specialist_channels = {
-                modality: list(retrieval_fanout.results.get(modality, ()))
+                modality: _filter_to_active_videos(
+                    retrieval_fanout.results.get(modality, ()), self._active_video_ids
+                )
                 for modality in modalities
             }
         else:
-            baseline_visual_retrieved = self.kis.search(
-                query, topk=visual_retrieval_topk
+            baseline_visual_retrieved = _filter_to_active_videos(
+                self.kis.search(query, topk=visual_retrieval_topk), self._active_video_ids
             )
         visual_retrieved = list(baseline_visual_retrieved)
         # An explicit verse request can use a precision ASR-event lane.  The
@@ -1980,6 +2013,9 @@ class VQAPipelineV3:
                         item for item in (global_poetry(query, question, topk=20) or ())
                         if isinstance(item, dict)
                     ]
+                    poetry_global_candidates = _filter_to_active_videos(
+                        poetry_global_candidates, self._active_video_ids
+                    )
                     poetry_global_trace = {
                         "status": (
                             "candidates" if poetry_global_candidates else "not_eligible_or_no_event"
@@ -2012,7 +2048,9 @@ class VQAPipelineV3:
             )
             if not isinstance(result, ImageGroundingResult):
                 raise TypeError("image grounding provider must return ImageGroundingResult")
-            image_candidates = [candidate.to_dict() for candidate in result.candidates]
+            image_candidates = _filter_to_active_videos(
+                [candidate.to_dict() for candidate in result.candidates], self._active_video_ids
+            )
             image_grounding.update(result.to_dict())
             if image_candidates:
                 visual_retrieved, image_visual_fusion = _fuse_visual_with_image_grounding(
@@ -2024,11 +2062,14 @@ class VQAPipelineV3:
         if route_requested:
             claim_retriever = getattr(global_modality_router, "global_claim_candidates", None)
             if retrieval_claim_policy.active and callable(claim_retriever):
-                claim_candidates = list(claim_retriever(
-                    retrieval_claim_policy,
-                    modalities,
-                    topk_per_claim=100,
-                ) or ())
+                claim_candidates = _filter_to_active_videos(
+                    claim_retriever(
+                        retrieval_claim_policy,
+                        modalities,
+                        topk_per_claim=100,
+                    ) or (),
+                    self._active_video_ids,
+                )
         specialist_hits = {
             modality: bool(specialist_channels.get(modality)) for modality in modalities
         }
@@ -2066,6 +2107,7 @@ class VQAPipelineV3:
             return output
 
         routing_trace = {
+            "active_video_count": len(self._active_video_ids) or None,
             "required_modalities": list(declared_modalities),
             "support_modalities": list(modalities),
             "visual_top_videos": [str(row[0]) for row in visual_retrieved[:20]],

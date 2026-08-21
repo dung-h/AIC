@@ -212,6 +212,9 @@ HCMAI_PUBLIC_MODEL_ROOT=/opt/hcmai-models
 HCMAI_PUBLIC_DOWNLOAD_ROOT=/opt/hcmai-downloads
 # Optional; this is already the default for the preselection runtime.
 HCMAI_PUBLIC_KEYFRAME_ARCHIVES=keyframes-L21-L25.tar,keyframes-L26-L30.tar
+# Match retrieval to the installed archive packs. Remove this only after all
+# K-series archives have also been installed.
+HCMAI_ACTIVE_VIDEO_PREFIXES=L
 ```
 
 If the server user is not root, grant it ownership of the two external asset
@@ -233,7 +236,9 @@ only `keyframes-L21-L25.tar` and `keyframes-L26-L30.tar`, plus `bge-m3` and
 `Qwen2.5-VL-7B-Instruct`. It does **not** download the raw `data/keyframes`
 Drive tree, the four K-series archives, or Qwen 3B. It validates archive paths,
 extracts only the selected packs to `data/keyframes`, and refuses to overwrite
-an already present pack. The tool stores only local SHA-256 receipts because a
+an already present pack. `HCMAI_ACTIVE_VIDEO_PREFIXES=L` also filters the
+global visual/ASR/OCR retrieval lanes before ranking, so K-series rows cannot
+consume a candidate slot without an installed image. The tool stores only local SHA-256 receipts because a
 public Drive folder does not expose the authenticated rclone MD5 manifest. Run
 preflight afterward; this validates the real index/model/frame contracts. The
 public bootstrap uses [gdown](https://github.com/wkentaro/gdown), which
@@ -247,6 +252,9 @@ each needed pack:
 ./scripts/competition.sh public-bootstrap fetch --yes --asset keyframes \
   --archive keyframes-K01-K05.tar
 ```
+
+After all four K archives are installed, remove `HCMAI_ACTIVE_VIDEO_PREFIXES`
+from `.env` (or set `HCMAI_ACTIVE_VIDEO_PREFIXES=L,K`) before `preflight`.
 
 Finally hydrate the two visual backbones once, then return to offline mode:
 

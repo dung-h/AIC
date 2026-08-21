@@ -32,9 +32,33 @@ from src.utils.open_clip_local import (  # noqa: E402
 IDX = str(INDEX_DIR)
 
 
+def _normalise_active_video_prefixes(value: object | None) -> tuple[str, ...]:
+    """Return an explicit, deterministic subset selector for installed packs.
+
+    A global index can contain K and L videos while a preselection deployment
+    intentionally installs only L keyframes.  Ranking unavailable videos and
+    dropping their frames later wastes the finite top-k budget.  The selector
+    is opt-in for backward compatibility and is applied before video ranking.
+    """
+    if value is None:
+        value = os.getenv("HCMAI_ACTIVE_VIDEO_PREFIXES", "")
+    if isinstance(value, str):
+        values = value.split(",")
+    else:
+        try:
+            values = list(value)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ValueError("active video prefixes must be a comma-separated string or sequence") from exc
+    prefixes = tuple(dict.fromkeys(str(item).strip().upper() for item in values if str(item).strip()))
+    if any(not prefix.replace("_", "").isalnum() for prefix in prefixes):
+        raise ValueError("active video prefixes must contain only alphanumeric characters or underscores")
+    return prefixes
+
+
 class KISFusionRetriever:
     def __init__(self, translate=False, alpha=0.4, translate_cache=None,
-                 nllb_routing=False, nllb_threshold=0.05):
+                 nllb_routing=False, nllb_threshold=0.05,
+                 active_video_prefixes=None):
         import torch
         import open_clip
 
@@ -70,10 +94,26 @@ class KISFusionRetriever:
         self.km = pd.read_parquet(os.path.join(IDX, "global_keyframes_vitl.parquet")).reset_index(drop=True)
         if len(self.F_vitl) != len(self.km):
             raise ValueError(f"ViT-L feature/map length mismatch: {len(self.F_vitl)} vs {len(self.km)}")
-        self.vid_arr = self.km.video_id.values
-        self.all_vids = np.array(sorted(set(self.vid_arr)))
+        self.vid_arr = self.km.video_id.astype(str).values
+        self.active_video_prefixes = _normalise_active_video_prefixes(active_video_prefixes)
+        active_mask = np.ones(len(self.vid_arr), dtype=bool)
+        if self.active_video_prefixes:
+            active_mask = np.fromiter(
+                (str(video_id).upper().startswith(self.active_video_prefixes) for video_id in self.vid_arr),
+                dtype=bool,
+                count=len(self.vid_arr),
+            )
+            if not bool(active_mask.any()):
+                raise ValueError(
+                    "active video prefixes matched no indexed video: "
+                    + ", ".join(self.active_video_prefixes)
+                )
+        self._active_row_idx = np.flatnonzero(active_mask)
+        self.all_vids = np.array(sorted(set(self.vid_arr[self._active_row_idx])))
         self._vidx = {v: i for i, v in enumerate(self.all_vids)}
-        self._vid_idx_arr = np.array([self._vidx[v] for v in self.vid_arr], dtype=np.int32)
+        self._active_vid_idx_arr = np.array(
+            [self._vidx[self.vid_arr[row]] for row in self._active_row_idx], dtype=np.int32
+        )
         self._frame_idx_arr = self.km.frame_idx.to_numpy(dtype=np.int64, copy=False)
         self._kf_n_arr = self.km.kf_n.to_numpy(dtype=np.int64, copy=False)
         self._pts_time_arr = self.km.pts_time.to_numpy(dtype=np.float32, copy=False)
@@ -138,7 +178,8 @@ class KISFusionRetriever:
 
         print(
             f"[KISFusion] vitl={self.F_vitl.shape}, so400m={None if self.F_so is None else self.F_so.shape}, "
-            f"videos={len(self.all_vids)}, alpha={alpha}, translate={translate}, device={self.dev}"
+            f"videos={len(self.all_vids)}, prefixes={self.active_video_prefixes or ('all',)}, "
+            f"alpha={alpha}, translate={translate}, device={self.dev}"
         )
 
     def _ensure_nllb_model(self):
@@ -195,7 +236,7 @@ class KISFusionRetriever:
 
     def _maxvec(self, frame_sc: np.ndarray) -> np.ndarray:
         out = np.full(len(self.all_vids), -9.0, np.float32)
-        np.maximum.at(out, self._vid_idx_arr, frame_sc)
+        np.maximum.at(out, self._active_vid_idx_arr, frame_sc[self._active_row_idx])
         return out
 
     @staticmethod
