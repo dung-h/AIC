@@ -22,6 +22,7 @@ from cache import get_cache
 from offline_fallback import get_text_embedder
 from paths import INDEX_DIR
 from src.core.providers import provider_for
+from src.pipelines.kis_fusion_retriever import _normalise_active_video_prefixes
 from src.utils.open_clip_local import get_tokenizer as get_local_tokenizer
 try:
     from src.trake.contracts import (
@@ -106,6 +107,23 @@ class TrakePipeline:
         self.ac = self.asr_index.chunks
         self.ce = self.asr_index.embeddings
         self.no_speech_videos = set(self.asr_index.no_speech_videos)
+        self.active_video_prefixes = _normalise_active_video_prefixes(None)
+        if self.active_video_prefixes:
+            active_mask = self.ac["vid"].astype(str).str.upper().str.startswith(
+                self.active_video_prefixes
+            ).to_numpy()
+            if not bool(active_mask.any()):
+                raise RuntimeError(
+                    "active video prefixes matched no ASR TRAKE rows: "
+                    + ", ".join(self.active_video_prefixes)
+                )
+            active_rows = np.flatnonzero(active_mask)
+            # Preserve the original embedding-row index.  Fancy-indexing a
+            # large mmap here would eagerly duplicate the full ASR matrix.
+            self.ac = self.ac.iloc[active_rows].copy()
+            self.no_speech_videos.intersection_update(set(self.ac["vid"].astype(str)))
+        self._active_asr_rows = self.ac.index.to_numpy(dtype=np.int64, copy=False)
+        self._active_asr_videos = tuple(sorted(set(self.ac["vid"].astype(str))))
         self.index_diagnostics = self.asr_index.diagnostics()
         print(
             f"[TRAKE] ASR global pool: {len(self.ac)} chunks / "
@@ -137,16 +155,18 @@ class TrakePipeline:
         query /= max(float(np.linalg.norm(query)), 1e-8)
         scores = self.ce @ query
         if candidate_videos is None:
-            indices = np.arange(len(self.ac), dtype=np.int64)
+            indices = self._active_asr_rows
         else:
             allowed = {str(value).strip().upper() for value in candidate_videos}
-            indices = np.flatnonzero(self.ac["vid"].astype(str).isin(allowed).to_numpy())
+            indices = self.ac.index[
+                self.ac["vid"].astype(str).isin(allowed)
+            ].to_numpy(dtype=np.int64, copy=False)
         if len(indices) == 0:
             return []
         order = indices[np.argsort(-scores[indices], kind="mergesort")[:top_k]]
         hits = []
         for index in order:
-            row = self.ac.iloc[int(index)]
+            row = self.ac.loc[int(index)]
             if pd.isna(row.get("frame_idx")) or pd.isna(row.get("kf_n")):
                 continue
             start = row.get("start")
@@ -210,7 +230,7 @@ class TrakePipeline:
                 dict.fromkeys(str(value).strip().upper() for value in candidate_videos)
             )
         else:
-            target_vids = list(self.asr_index.videos)
+            target_vids = list(self._active_asr_videos)
         for vid in target_vids:
             # A no-speech video is valid build coverage but has no evidence;
             # skip it explicitly instead of inventing a frame or treating it
@@ -335,6 +355,20 @@ class VisualTrakePipeline:
             raise FileNotFoundError("visual TRAKE index is incomplete")
         self.km = pd.read_parquet(km_path).reset_index(drop=True)
         self.features = np.load(feat_path, mmap_mode="r")
+        self.active_video_prefixes = _normalise_active_video_prefixes(None)
+        active_mask = np.ones(len(self.km), dtype=bool)
+        if self.active_video_prefixes:
+            video_ids = self.km["video_id"].astype(str).str.upper()
+            active_mask = video_ids.str.startswith(self.active_video_prefixes).to_numpy()
+            if not bool(active_mask.any()):
+                raise ValueError(
+                    "active video prefixes matched no TRAKE index rows: "
+                    + ", ".join(self.active_video_prefixes)
+                )
+        self._active_indices = np.flatnonzero(active_mask)
+        self._active_video_ids = tuple(sorted(set(
+            self.km.iloc[self._active_indices]["video_id"].astype(str)
+        )))
         self._model = None
         self._tokenizer = None
         self._device = "cpu"
@@ -405,9 +439,10 @@ class VisualTrakePipeline:
         vector /= max(float(np.linalg.norm(vector)), 1e-8)
         scores = np.asarray(self.features @ vector, dtype=np.float32)
         if candidate_videos is None:
-            indices = np.arange(len(self.km), dtype=np.int64)
+            indices = self._active_indices
         else:
             allowed = {str(value) for value in candidate_videos}
+            allowed.intersection_update(self._active_video_ids)
             indices = np.flatnonzero(self.km["video_id"].astype(str).isin(allowed).to_numpy())
         if len(indices) == 0:
             return []
@@ -464,6 +499,14 @@ class VisualTrakePipeline:
         self._visual.embed_provider = lambda _: vectors
         if video_id is not None and candidate_videos is not None:
             raise ValueError("video_id and candidate_videos are mutually exclusive")
+        if video_id is not None and str(video_id) not in self._active_video_ids:
+            return []
+        if candidate_videos is None:
+            candidate_videos = self._active_video_ids
+        else:
+            candidate_videos = tuple(
+                video for video in candidate_videos if str(video) in self._active_video_ids
+            )
         result = self._visual.align(
             texts,
             video_id=video_id,

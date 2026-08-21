@@ -19,6 +19,7 @@ import shutil
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "..", "utils"))
 from paths import INDEX_DIR, KEYFRAMES_DIR
+from src.pipelines.kis_fusion_retriever import _normalise_active_video_prefixes
 
 IDX = str(INDEX_DIR)
 
@@ -32,9 +33,22 @@ class VKISPipeline:
         # Pass the ViT-B/16 pair for the legacy 768-dim index.
         self.vfeat = np.load(os.path.join(IDX, index_npy), mmap_mode="r")
         self.vmap = pd.read_parquet(os.path.join(IDX, keyframes_parquet)).reset_index(drop=True)
+        self.active_video_prefixes = _normalise_active_video_prefixes(None)
+        active_mask = np.ones(len(self.vmap), dtype=bool)
+        if self.active_video_prefixes:
+            active_mask = self.vmap["video_id"].astype(str).str.upper().str.startswith(
+                self.active_video_prefixes
+            ).to_numpy()
+            if not bool(active_mask.any()):
+                raise ValueError(
+                    "active video prefixes matched no VKIS index rows: "
+                    + ", ".join(self.active_video_prefixes)
+                )
+        self._active_indices = np.flatnonzero(active_mask)
         self.video_groups = [
             (str(video), group.sort_values("pts_time").index.to_numpy(dtype=np.int64))
             for video, group in self.vmap.groupby("video_id", sort=False)
+            if bool(active_mask[group.index].any())
         ]
         self.video_group_ids = {video: ids for video, ids in self.video_groups}
         import torch, open_clip
@@ -121,7 +135,7 @@ class VKISPipeline:
         """Search 1 ảnh query."""
         q = self.encode_image(img_path)
         scores = self.vfeat @ q
-        order = np.argsort(-scores)[:topk]
+        order = self._active_indices[np.argsort(-scores[self._active_indices])[:topk]]
         out = []
         for j in order:
             row = self.vmap.iloc[j]
@@ -182,7 +196,7 @@ class VKISPipeline:
                 scores[[str(v) not in selected for v in self.vmap.video_id]] = -np.inf
             else:
                 scores = sims.mean(axis=1)
-        order = np.argsort(-scores)[:topk]
+        order = self._active_indices[np.argsort(-scores[self._active_indices])[:topk]]
         out = []
         for j in order:
             row = self.vmap.iloc[j]
