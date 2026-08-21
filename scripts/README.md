@@ -5,6 +5,7 @@
 ```bash
 ./scripts/competition.sh preflight
 ./scripts/competition.sh bootstrap plan
+./scripts/competition.sh public-bootstrap plan
 ./scripts/competition.sh run --queries QUERY.json --output OUT.json
 ```
 
@@ -16,3 +17,8 @@ defaults, and delegates to the fail-closed CLI modules under `src/cli/`.
 only `fetch --yes` downloads or extracts artifacts. `build_source_bundle.sh`
 creates a source-only tarball from the same Git ignore contract. Benchmark and
 profiling scripts are diagnostic, not submission entrypoints.
+
+`public_runtime_bootstrap.py` is the credential-free equivalent for public
+Google Drive folders. It uses `gdown`, requires separate public links for
+`data/index`, `data/keyframe_archives_v2`, and `models`, and refuses to merge
+over an existing runtime. It must be invoked as `public-bootstrap fetch --yes`.

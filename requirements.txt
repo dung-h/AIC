@@ -57,6 +57,9 @@ scikit-learn>=1.5
 diskcache>=5.6                   # persistent cache layer (src/core/cache.py)
 tqdm>=4.66
 
+# ---- Public runtime bootstrap (no Google OAuth/rclone credential) ----
+gdown>=6.0
+
 # ---- Tests ----
 pytest>=8.0
 pytest-timeout>=2.3

@@ -45,7 +45,7 @@ fi
 
 command_name="${1:-}"
 if [[ -z "$command_name" ]]; then
-  echo "Usage: $0 preflight|run|bootstrap [arguments...]" >&2
+  echo "Usage: $0 preflight|run|bootstrap|public-bootstrap [arguments...]" >&2
   exit 2
 fi
 shift
@@ -61,8 +61,11 @@ case "$command_name" in
   bootstrap)
     exec "$python_bin" scripts/runtime_data_bootstrap.py "$@"
     ;;
+  public-bootstrap)
+    exec "$python_bin" scripts/public_runtime_bootstrap.py "$@"
+    ;;
   *)
-    echo "Unknown command: $command_name (expected preflight, run, or bootstrap)" >&2
+    echo "Unknown command: $command_name (expected preflight, run, bootstrap, or public-bootstrap)" >&2
     exit 2
     ;;
 esac

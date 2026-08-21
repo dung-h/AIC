@@ -130,6 +130,7 @@ scripts/*
 !scripts/build_source_bundle.sh
 !scripts/competition.sh
 !scripts/competition_preflight.sh
+!scripts/public_runtime_bootstrap.py
 !scripts/runtime_data_bootstrap.py
 !scripts/runtime_env.sh
 !scripts/smoke_direct_vqa.py

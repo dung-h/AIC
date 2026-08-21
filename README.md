@@ -146,6 +146,13 @@ The image branch automatically skips factual/ASR/OCR-contracted questions;
 it is reserved for visual OOK entities and records every source page in the
 runtime trace.
 
+## Provision runtime assets
+
+Choose exactly one transfer path. Both paths preserve the same local runtime
+layout and end with the same `preflight` command.
+
+### Private Drive with rclone
+
 Configure a personal/team `rclone` remote named `gdrive`, then inspect the
 local state first. `plan` makes no network call. `fetch --yes` is explicit,
 uses checksum validation and refuses to overwrite unmanaged data.
@@ -173,6 +180,67 @@ HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 hf download \
 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 hf download \
   --cache-dir "$HF_HUB_CACHE" timm/ViT-SO400M-16-SigLIP2-384
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+./scripts/competition.sh preflight --provider local --require-gpu \
+  --require-modality-runtime --json-output results/preflight.json
+```
+
+### Public Google Drive, no credential on the server
+
+Do not publish the top-level `runtime` folder: it contains a legacy raw
+`data/keyframes` tree. Instead, publish exactly these three child folders and
+copy their three Google Drive *folder* links:
+
+```text
+data/index
+data/keyframe_archives_v2
+models
+```
+
+Set the non-secret links and runtime paths in the server's `.env`:
+
+```text
+HCMAI_PYTHON=/opt/hcmai-venv/bin/python
+HCMAI_LOCAL_VLM_PATH=/opt/hcmai-models/Qwen2.5-VL-7B-Instruct
+VQA_MODALITY_MODEL_DIR=/opt/hcmai-models/bge-m3
+HF_HOME=/opt/hcmai-models/huggingface
+HF_HUB_CACHE=/opt/hcmai-models/huggingface/hub
+HCMAI_PUBLIC_INDEX_URL=https://drive.google.com/drive/folders/<index-id>
+HCMAI_PUBLIC_KEYFRAMES_URL=https://drive.google.com/drive/folders/<archive-id>
+HCMAI_PUBLIC_MODELS_URL=https://drive.google.com/drive/folders/<models-id>
+HCMAI_PUBLIC_MODEL_ROOT=/opt/hcmai-models
+HCMAI_PUBLIC_DOWNLOAD_ROOT=/opt/hcmai-downloads
+```
+
+If the server user is not root, grant it ownership of the two external asset
+directories once:
+
+```bash
+sudo install -d -o "$USER" -g "$USER" /opt/hcmai-models /opt/hcmai-downloads
+```
+
+Then the public bootstrap has no OAuth token, rclone config, or API key:
+
+```bash
+./scripts/competition.sh public-bootstrap plan
+./scripts/competition.sh public-bootstrap fetch --yes
+```
+
+It downloads the six compressed keyframe archives, validates archive paths,
+extracts them to `data/keyframes`, and refuses to overwrite an existing
+runtime. The tool stores only local SHA-256 receipts because a public Drive
+folder does not expose the authenticated rclone MD5 manifest. Run preflight
+afterward; this validates the real index/model/frame contracts. The public
+bootstrap uses [gdown](https://github.com/wkentaro/gdown), which supports
+public Drive folders and resumes partial downloads.
+
+Finally hydrate the two visual backbones once, then return to offline mode:
+
+```bash
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "$HCMAI_PYTHON" -c \
+  'import os; from huggingface_hub import snapshot_download; snapshot_download("timm/ViT-L-16-SigLIP2-256", cache_dir=os.environ["HF_HUB_CACHE"])'
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "$HCMAI_PYTHON" -c \
+  'import os; from huggingface_hub import snapshot_download; snapshot_download("timm/ViT-SO400M-16-SigLIP2-384", cache_dir=os.environ["HF_HUB_CACHE"])'
 
 ./scripts/competition.sh preflight --provider local --require-gpu \
   --require-modality-runtime --json-output results/preflight.json
