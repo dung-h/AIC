@@ -1,4 +1,5 @@
 .env
+.env.remote
 
 # Private corpus, review/holdout evidence and generated runtime artifacts.
 # Public source carries no query/answer annotations or experiment output.
@@ -133,6 +134,7 @@ scripts/*
 !scripts/public_runtime_bootstrap.py
 !scripts/runtime_data_bootstrap.py
 !scripts/runtime_env.sh
+!scripts/export_remote_env.py
 !scripts/smoke_direct_vqa.py
 !scripts/wsl_python.sh
 

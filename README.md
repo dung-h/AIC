@@ -273,6 +273,27 @@ automatically downloading a large runtime during a competition request is
 unsafe. On a new server the operator performs one explicit, selective fetch;
 thereafter `run` is offline-first.
 
+### Private API profile for a remote server
+
+The public bootstrap does not need a secret. To use the already configured
+Lightning VLM for Q&A on a remote server, generate a minimal **private** dotenv
+locally; the file is written under ignored `dist/` and is mode `0600`:
+
+```bash
+.venv/bin/python scripts/export_remote_env.py --answer-provider openai
+```
+
+It contains only the Lightning VLM configuration required by the API answer
+provider, plus the public L-series bootstrap configuration. Transfer it only
+over an authenticated channel, place it at `<remote-clone>/.env`, and keep its
+mode at `0600`. Do not commit it. Deepgram is not required to query the
+materialized ASR index; add it only for an authorized ASR rebuild:
+
+```bash
+.venv/bin/python scripts/export_remote_env.py --answer-provider openai \
+  --include-deepgram
+```
+
 ## Competition commands
 
 ```bash
