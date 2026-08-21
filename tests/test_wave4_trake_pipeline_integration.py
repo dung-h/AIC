@@ -39,7 +39,7 @@ def _rows(video_id="video-1"):
     }
 
 
-def _write_merged_asr(tmp_path, *, bad_canonical=False):
+def _write_merged_asr(tmp_path, *, bad_canonical=False, duplicate_frame=False):
     """Create the persisted global-index contract used by production ASR."""
     asr_dir = tmp_path / "asr_global_merged_v2"
     asr_dir.mkdir()
@@ -50,7 +50,7 @@ def _write_merged_asr(tmp_path, *, bad_canonical=False):
     canonical_path = tmp_path / "global_keyframes.parquet"
     canonical.to_parquet(canonical_path, index=False)
     frame_values = [10, 20] if not bad_canonical else [10, 999]
-    metadata = pd.DataFrame([
+    metadata_rows = [
         {
             "embedding_row": 0,
             "video_id": "VIDEO-1",
@@ -62,22 +62,41 @@ def _write_merged_asr(tmp_path, *, bad_canonical=False):
             "frame_idx": frame_values[0],
             "pts_time": 1.0,
         },
-        {
+    ]
+    if duplicate_frame:
+        metadata_rows.append({
             "embedding_row": 1,
             "video_id": "VIDEO-1",
             "chunk_index": 1,
-            "start": 2.0,
-            "end": 3.0,
-            "text": "a second spoken event",
-            "kf_n": 2,
-            "frame_idx": frame_values[1],
-            "pts_time": 2.0,
-        },
-    ])
+            "start": 2.1,
+            "end": 2.9,
+            "text": "a second event at the same canonical frame",
+            "kf_n": 1,
+            "frame_idx": frame_values[0],
+            "pts_time": 1.0,
+        })
+    metadata_rows.append({
+        "embedding_row": 2 if duplicate_frame else 1,
+        "video_id": "VIDEO-1",
+        "chunk_index": 2 if duplicate_frame else 1,
+        "start": 3.0 if duplicate_frame else 2.0,
+        "end": 4.0 if duplicate_frame else 3.0,
+        "text": "a second spoken event",
+        "kf_n": 2,
+        "frame_idx": frame_values[1],
+        "pts_time": 2.0,
+    })
+    metadata = pd.DataFrame(metadata_rows)
     metadata.to_parquet(asr_dir / "retrieval.parquet", index=False)
     np.save(
         asr_dir / "embeddings.npy",
-        np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+        np.asarray(
+            (
+                [[1.0, 0.0], [0.1, 1.0], [0.1, 0.8]]
+                if duplicate_frame else [[1.0, 0.0], [1.0, 0.0]]
+            ),
+            dtype=np.float32,
+        ),
     )
     manifest = {
         "status": "ready",
@@ -142,6 +161,31 @@ def test_asr_alignment_returns_canonical_strictly_ordered_frames(monkeypatch, tm
     path = results[0]["path"]
     assert [row["frame_idx"] for row in path] == [10, 20]
     assert [row["pts_time"] for row in path] == [1.0, 2.0]
+
+
+def test_asr_alignment_resolves_duplicate_chunk_frame_before_dante(monkeypatch, tmp_path):
+    asr_dir = _write_merged_asr(tmp_path, duplicate_frame=True)
+
+    class EventSpecificEmbedder:
+        def embed(self, texts):
+            vectors = []
+            for text in texts:
+                if text == "collision first":
+                    vectors.append([1.0, 0.0])
+                elif text == "collision second":
+                    vectors.append([0.0, 1.0])
+                else:
+                    vectors.append([0.0, 0.0])
+            return np.asarray(vectors, dtype=np.float32)
+
+    monkeypatch.setattr(module, "get_text_embedder", lambda mode: EventSpecificEmbedder())
+    pipeline = TrakePipeline(asr_index_dir=asr_dir)
+
+    results = pipeline.align(["collision first", "collision second"], top_k_videos=1)
+
+    assert len(results) == 1
+    assert [row["frame_idx"] for row in results[0]["path"]] == [10, 20]
+    assert [row["kf_n"] for row in results[0]["path"]] == [1, 2]
 
 
 def test_asr_mode_selection_is_explicit():

@@ -170,6 +170,18 @@ def _default_text_checker(answer: str, evidence: TextEvidence) -> Mapping[str, A
     evidence_tokens = _tokens(evidence_text)
     if answer_tokens and answer_tokens.issubset(evidence_tokens):
         return {"supported": True, "score": 0.8, "reason": "token_match"}
+    # ASR commonly changes one or two syllables in a long quotation while
+    # retaining the rest of the recitation.  This is deliberately unavailable
+    # to short entity answers: a five-token minimum and 80% coverage prevent
+    # a generic overlapping phrase from becoming evidence.
+    if len(answer_tokens) >= 5:
+        overlap = len(answer_tokens.intersection(evidence_tokens)) / len(answer_tokens)
+        if overlap >= 0.80:
+            return {
+                "supported": True,
+                "score": round(overlap, 6),
+                "reason": "long_asr_ocr_overlap",
+            }
     return {"supported": False, "score": 0.0, "reason": "no_text_match"}
 
 

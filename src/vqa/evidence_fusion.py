@@ -289,6 +289,13 @@ def build_evidence_packet(candidate: Mapping[str, Any], *, asr_rows: Iterable[An
         evidence_time = _number(evidence_frame.get("pts_time"))
         if evidence_time is None:
             continue
+        relation = str(evidence_frame.get("relation", "")).strip().lower()
+        if not relation and abs(float(evidence_time) - float(pts_time)) <= 20.0:
+            # Backwards-compatible input seam for already-bounded legacy
+            # candidates. New production allocators always annotate relation.
+            relation = "bounded_temporal_neighbor"
+        if relation not in {"same_frame", "bounded_temporal_neighbor"}:
+            continue
         if modality == "asr":
             asr_anchor_times.append(evidence_time)
         elif modality == "ocr":
@@ -317,6 +324,12 @@ def build_evidence_packet(candidate: Mapping[str, Any], *, asr_rows: Iterable[An
         item_kf = item.get("kf_n")
         if item_video != video_id or item_frame is None or item_kf is None:
             continue
+        relation = str(item.get("relation", "")).strip().lower()
+        item_time = _number(item.get("pts_time"), pts_time)
+        if not relation and item_time is not None and abs(float(item_time) - float(pts_time)) <= 20.0:
+            relation = "bounded_temporal_neighbor"
+        if relation not in {"same_frame", "bounded_temporal_neighbor"}:
+            continue
         if canonical_map is not None:
             expected = canonical_map.get((item_video, int(item_kf)))
             if expected is None:
@@ -330,6 +343,7 @@ def build_evidence_packet(candidate: Mapping[str, Any], *, asr_rows: Iterable[An
             "video_id": video_id, "frame_idx": int(item_frame), "kf_n": int(item_kf),
             "pts_time": float(_number(item.get("pts_time"), pts_time) or pts_time),
             "frame_path": item.get("frame_path"), "role": item.get("role", "neighbor"),
+            "relation": relation,
         })
     sources = ["visual"]
     if asr:
@@ -454,6 +468,16 @@ def render_evidence_prompt(packet: Mapping[str, Any]) -> str:
             lines.append(f"- [{point_text}s] {item.get('text', '')}")
     else:
         lines.append("OCR screen-text evidence: (none)")
+    claim_evidence = packet.get("claim_evidence", [])
+    if claim_evidence:
+        lines.append("Query-constraint evidence (identifies the same entity/condition; not answer evidence by itself):")
+        for item in claim_evidence:
+            if not isinstance(item, Mapping):
+                continue
+            source = str(item.get("source", "text")).upper()
+            claim = item.get("claim", {})
+            claim_text = claim.get("text", "") if isinstance(claim, Mapping) else ""
+            lines.append(f"- [{source}] claim={claim_text!s}: {item.get('text', '')}")
     lines.append("Anchor timestamp: {:.2f}s; anchor frame is the output grounding frame.".format(
         float(packet.get("anchor", {}).get("pts_time", 0.0))))
     return "\n".join(lines)

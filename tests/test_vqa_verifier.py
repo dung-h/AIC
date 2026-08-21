@@ -39,6 +39,19 @@ def test_verifier_accepts_answer_supported_by_ocr():
     assert result.supported_sources == ("ocr",)
 
 
+def test_verifier_accepts_long_asr_quote_with_bounded_transcription_noise():
+    result = EvidenceVerifier().verify(
+        "Hỏa hồng Nhật Tảo oanh thiên địa Kiếm bạt Kiên Giang khấp quỷ thần",
+        _candidate(asr_chunks=[{
+            "start": 8.0, "end": 12.0,
+            "chunk": "Hóa hồng Nhật Tảo quanh thiên địa Kiếm bạt Kiên Giang khắp vị thần",
+        }]),
+        required_sources=("asr",),
+    )
+    assert result.abstain is False
+    assert result.checks[0].reason == "long_asr_ocr_overlap"
+
+
 def test_verifier_uses_injected_visual_checker_for_frame_only_evidence():
     seen = []
 

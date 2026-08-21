@@ -13,7 +13,12 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 
-SOURCE_PRIORITY = {"visual": 0, "asr": 1, "ocr": 1, "temporal": 2}
+# ``external_image`` is not a web-frame source: it is a local VKIS hit seeded
+# by a web reference image. Keep it adjacent to visual provenance, while the
+# original visual channel still wins stable anchor ties.
+SOURCE_PRIORITY = {
+    "visual": 0, "external_image": 1, "asr": 1, "ocr": 1, "temporal": 2,
+}
 SPECIALIST_SOURCES = frozenset({"asr", "ocr"})
 TEMPORAL_SOURCES = frozenset({"temporal", "temporal_neighbor", "neighbor"})
 
@@ -70,6 +75,15 @@ def _provenance_record(candidate: Mapping[str, Any], source: str) -> dict[str, A
     rank = candidate.get("retrieval_rank", candidate.get("rank"))
     if rank is not None:
         record["retrieval_rank"] = int(rank)
+    # When a visual and specialist row share one canonical frame, the visual
+    # row remains the stable selector anchor. Preserve the specialist's real
+    # text/provenance separately so downstream evidence-role joins do not
+    # mistake that merged candidate for a visual-only frame.
+    if source in SPECIALIST_SOURCES:
+        for key in ("text", "evidence", "view_provenance", "score_mode"):
+            value = candidate.get(key)
+            if value not in (None, "", (), []):
+                record[key] = value
     return record
 
 
@@ -314,10 +328,24 @@ def _candidate_priority(candidate: Mapping[str, Any], *, video_rank: int,
         default=len(preferred_order),
     )
     preferred_rank = 0 if preferred_source_rank < len(preferred_order) else 1
+    # Once a caller explicitly asks for a primary specialist, source priority
+    # must be evaluated *inside that lane*.  A weak OCR hit that happens to
+    # share a visual frame must not beat a stronger OCR-only recipe/sign frame
+    # solely because ``visual`` has global priority 0.
+    prioritized_sources = sources.intersection(preferred_order) or sources
     source_rank = min(
-        (SOURCE_PRIORITY.get(source, 3) for source in sources),
+        (SOURCE_PRIORITY.get(source, 3) for source in prioritized_sources),
         default=3,
     )
+    # Localized rows are not another retrieval channel and cannot rescue a
+    # video. They are, however, an explicit local proof (quote, named fact,
+    # numeric event, or compact recital) inside a video already admitted by
+    # global RRF. Prefer that proof over a broad global context row from the
+    # same channel/video; otherwise the answer stage can receive a frame far
+    # from the fact even though its timestamp was materialized correctly.
+    # This is query-agnostic: localization never manufactures a frame or
+    # changes the video shortlist.
+    localization_rank = 0 if bool(candidate.get("localized_evidence", False)) else 1
     key = candidate_key(candidate)
     channel_ranks = channel_ranks or {}
     candidate_channel_ranks = [
@@ -340,6 +368,7 @@ def _candidate_priority(candidate: Mapping[str, Any], *, video_rank: int,
         preferred_rank,
         preferred_source_rank,
         source_rank,
+        localization_rank,
         within_rank,
         retrieval_rank,
         int(candidate_key(candidate)[1]),
@@ -432,6 +461,7 @@ def allocate_recall_preserving_candidates(
     specialist_reservation: int = 1,
     temporal_reservation: int = 1,
     per_video_cap: int = 2,
+    prefer_specialist_anchors: bool = False,
     relevant_keys: Iterable[tuple[str, int]] = (),
     selection_policy: str = "coverage",
 ) -> AllocationResult:
@@ -480,6 +510,8 @@ def allocate_recall_preserving_candidates(
         raise ValueError("specialist_reservation must be an integer >= 0")
     if isinstance(temporal_reservation, bool) or not isinstance(temporal_reservation, int) or temporal_reservation < 0:
         raise ValueError("temporal_reservation must be an integer >= 0")
+    if not isinstance(prefer_specialist_anchors, bool):
+        raise ValueError("prefer_specialist_anchors must be a boolean")
     selection_policy = str(selection_policy).strip().lower()
     if selection_policy not in {"coverage", "adaptive"}:
         raise ValueError("selection_policy must be 'coverage' or 'adaptive'")
@@ -582,7 +614,13 @@ def allocate_recall_preserving_candidates(
         coverage_floor = min(max_candidates, len(eligible))
     coverage_video_ids = eligible[:coverage_floor]
     specialist_anchor_enabled = bool(specialists) and (
-        coverage_floor < len(eligible)
+        # A declared primary ASR/OCR contract is not a mere support lane. Its
+        # real evidence must anchor the answer candidate even when the budget
+        # covers every ranked video. Otherwise a screen-text query can select
+        # a generic visual neighbour and discard the recipe/sign frame that
+        # actually proves the answer.
+        prefer_specialist_anchors
+        or coverage_floor < len(eligible)
         or max_candidates < len(eligible)
     )
     for video_id in coverage_video_ids:
@@ -786,6 +824,7 @@ def allocate_recall_preserving_candidates(
         "selection_stages": dict(sorted(stages.items())),
         "score_policy": "within_video_channel_rank_v1",
         "specialist_anchor_enabled": specialist_anchor_enabled,
+        "prefer_specialist_anchors": prefer_specialist_anchors,
         "visual_anchor_policy": (
             "specialist_evidence_first_then_visual_when_budget_constrained"
             if specialists

@@ -165,19 +165,35 @@ def _canonical_summary(path: Path, *, collect_pairs: bool = False) -> tuple[dict
 
 
 def _check_python(builder: ReportBuilder, config: PreflightConfig) -> None:
-    required_modules = list(REQUIRED_MODULES)
-    if config.require_modality_runtime:
-        required_modules.extend(MODALITY_RUNTIME_MODULES)
-    missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
-    if config.provider == "local" and importlib.util.find_spec("bitsandbytes") is None:
-        missing.append("bitsandbytes")
     executable = str(Path(sys.executable).resolve())
     linux = sys.platform.startswith("linux") and not executable.lower().endswith(".exe")
     isolated = sys.prefix != sys.base_prefix
     forbidden = [item for item in sys.path if "\\" in item or item.lower().endswith((".dll", ".pyd"))]
+    # WSL's /mnt mounts are Linux paths syntactically, but they retain slow
+    # cross-filesystem metadata semantics. A virtualenv there is forbidden by
+    # the runtime contract and must fail before any expensive package probe.
+    # ``Path(sys.executable).resolve()`` follows a venv's Python symlink to
+    # /usr/bin, so inspect sys.prefix as well; it names the actual venv root.
+    windows_mounted = any(
+        str(path).startswith("/mnt/")
+        for path in (executable, sys.prefix, sys.exec_prefix)
+    )
+    environment_safe = linux and isolated and not forbidden and not windows_mounted
+    required_modules = list(REQUIRED_MODULES)
+    if config.require_modality_runtime:
+        required_modules.extend(MODALITY_RUNTIME_MODULES)
+    missing = []
+    if environment_safe:
+        missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
+        if config.provider == "local" and importlib.util.find_spec("bitsandbytes") is None:
+            missing.append("bitsandbytes")
     probe_modules = required_modules + (["bitsandbytes"] if config.provider == "local" else [])
     probe_key = tuple(probe_modules)
-    if probe_key not in _IMPORT_PROBE_CACHE and not missing:
+    # A Windows-mounted or non-venv interpreter is already rejected by the
+    # deployment contract.  Do not make an invalid runtime spend minutes
+    # importing Torch/Transformers from a slow mount merely to report that
+    # same failure. Native Linux venvs retain the full isolated import probe.
+    if probe_key not in _IMPORT_PROBE_CACHE and not missing and environment_safe:
         code = "import importlib; " + "; ".join(
             f"importlib.import_module({name!r})" for name in probe_modules
         )
@@ -204,9 +220,14 @@ def _check_python(builder: ReportBuilder, config: PreflightConfig) -> None:
                 "ok": False, "returncode": None, "error": type(exc).__name__,
             }
     import_probe = _IMPORT_PROBE_CACHE.get(probe_key) or {
-        "ok": False, "returncode": None, "error": "modules missing",
+        "ok": False,
+        "returncode": None,
+        "error": (
+            "invalid_linux_virtualenv" if not environment_safe
+            else "modules missing"
+        ),
     }
-    ok = linux and isolated and not missing and not forbidden and sys.version_info >= (3, 10) and bool(import_probe["ok"])
+    ok = environment_safe and not missing and sys.version_info >= (3, 10) and bool(import_probe["ok"])
     builder.add(
         "python_environment", ok,
         "Linux virtual environment and required modules are available" if ok else "Python runtime is not competition-safe",
@@ -215,6 +236,7 @@ def _check_python(builder: ReportBuilder, config: PreflightConfig) -> None:
             "version": ".".join(map(str, sys.version_info[:3])),
             "linux": linux,
             "virtual_environment": isolated,
+            "windows_mounted": windows_mounted,
             "missing_modules": sorted(set(missing)),
             "required_modules": probe_modules if not missing else required_modules,
             "modality_runtime_required": config.require_modality_runtime,

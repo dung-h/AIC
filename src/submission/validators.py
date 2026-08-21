@@ -10,6 +10,8 @@ MAX_ANSWERS = 100
 _PLACEHOLDER_ANSWERS = {
     "", "evidence-only", "evidence only", "unavailable", "unknown", "n/a", "na", "null",
     "none", "cannot determine", "cannot be determined", "i don't know",
+    "placeholder", "no answer", "not available", "cannot answer", "can't answer",
+    "không xác định", "không thể trả lời", "không đủ thông tin",
 }
 
 

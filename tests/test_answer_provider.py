@@ -202,6 +202,36 @@ def test_api_adapter_retries_transport_with_bounded_backoff(tmp_path):
     assert sleeps == [0.25]
 
 
+def test_api_adapter_retries_transient_empty_choice_content(tmp_path):
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"fake-jpeg")
+    attempts = []
+    sleeps = []
+
+    def transport(*_args):
+        attempts.append(1)
+        if len(attempts) == 1:
+            return {"choices": [{"message": {"content": ""}}]}
+        return {
+            "choices": [{"message": {"content": (
+                '{"answer":"25 degrees","grounding_score":0.8,'
+                '"answer_confidence":0.7,"abstain":false}'
+            )}}]
+        }
+
+    provider = OpenAICompatibleAnswerProvider(
+        "https://api.example/v1", "gpt-test", api_key="secret",
+        retry_policy=RetryPolicy(max_attempts=2, initial_backoff_s=0.25, sleep=sleeps.append),
+        transport=transport,
+    )
+
+    response = provider.answer(_request(frame))
+
+    assert response.answer == "25 degrees"
+    assert len(attempts) == 2
+    assert sleeps == [0.25]
+
+
 def test_api_adapter_can_abstain_on_structured_response_without_network(tmp_path):
     frame = tmp_path / "frame.jpg"
     frame.write_bytes(b"fake-jpeg")

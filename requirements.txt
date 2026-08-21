@@ -80,4 +80,4 @@ accelerate>=1.0                 # device placement for local Qwen-VL materialize
 qwen-vl-utils>=0.0.10           # image/video preprocessing required by Qwen2.5-VL
 
 # ---- QUEST external image search (out-of-knowledge entities) ----
-# ddgs>=9.0
+ddgs>=9.0

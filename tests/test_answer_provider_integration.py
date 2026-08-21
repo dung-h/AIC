@@ -67,7 +67,7 @@ def test_ranked_qna_accepts_structured_answer_provider_without_local_vlm():
     assert provider.requests[0].evidence.video_id == "K01_V001"
 
 
-def test_screen_text_uses_pixels_as_primary_answer_evidence(tmp_path):
+def test_screen_text_rejects_when_bounded_ocr_does_not_support_answer(tmp_path):
     frame = tmp_path / "frame.jpg"
     frame.write_bytes(b"frame")
     provider = FakeProvider()
@@ -77,8 +77,10 @@ def test_screen_text_uses_pixels_as_primary_answer_evidence(tmp_path):
     pipeline.evidence_verifier = None
     packet = {
         "asr_chunks": (),
-        # A sampled OCR row can contain a ticker while the requested large
-        # sign is still visibly readable by the VLM in the same frame.
+    # A sampled OCR row can contain a ticker while the requested large sign
+    # may be visually readable.  The declared screen_text contract still
+    # requires the bounded OCR evidence to support the answer; otherwise a
+    # VLM can turn an unrelated candidate into a plausible hallucination.
         "ocr_text": ({"text": "unrelated news ticker", "start": 1.0, "end": 1.0},),
         "frames": ({
             "video_id": "K01_V001", "frame_idx": 120, "kf_n": 4,
@@ -101,9 +103,9 @@ def test_screen_text_uses_pixels_as_primary_answer_evidence(tmp_path):
         "_evidence_provider": _StaticEvidenceProvider(packet),
     }, use_context=False)
 
-    assert result["status"] == "answered_local"
-    assert result["answers"][0]["verification_policy"] == "visual_frame_primary"
-    assert result["answers"][0]["verification"]["accepted"] is True
+    assert result["status"] == "no_valid_local_answer"
+    assert result["answers"] == []
+    assert result["answer_trace"][0]["status"] == "rejected_verification"
 
 
 def test_ranked_answers_allows_explicit_remote_provider_only_in_online_mode():

@@ -110,10 +110,19 @@ class ModalityIndexRegistry:
     a global manifest is present.
     """
 
-    def __init__(self, index_dir: str | Path, canonical_name: str = "global_keyframes.parquet"):
+    def __init__(
+        self,
+        index_dir: str | Path,
+        canonical_name: str = "global_keyframes.parquet",
+        global_asr_dir: str | Path | None = None,
+    ):
         self.index_dir = Path(index_dir)
         self.canonical_path = self.index_dir / canonical_name
-        self.global_asr_dir = self.index_dir / GLOBAL_ASR_RELATIVE_DIR
+        self.global_asr_dir = (
+            Path(global_asr_dir)
+            if global_asr_dir is not None and str(global_asr_dir).strip()
+            else self.index_dir / GLOBAL_ASR_RELATIVE_DIR
+        )
         self.global_ocr_dir = self.index_dir / GLOBAL_OCR_RELATIVE_DIR
         self._source: GlobalASRSource | None = None
         self._ocr_source: GlobalOCRSource | None = None

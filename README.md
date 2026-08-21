@@ -74,9 +74,10 @@ python -m pip install torch torchvision --index-url https://download.pytorch.org
 python -m pip install -r requirements.txt
 
 export HCMAI_PYTHON=/opt/hcmai-venv/bin/python
-export HCMAI_LOCAL_VLM_PATH=/opt/models/Qwen2.5-VL-7B-Instruct
-export VQA_MODALITY_MODEL_DIR=/opt/models/bge-m3
-export HF_HUB_CACHE=/opt/models/huggingface/hub
+export HCMAI_LOCAL_VLM_PATH=/opt/hcmai-models/Qwen2.5-VL-7B-Instruct
+export VQA_MODALITY_MODEL_DIR=/opt/hcmai-models/bge-m3
+export HF_HOME=/opt/hcmai-models/huggingface
+export HF_HUB_CACHE=/opt/hcmai-models/huggingface/hub
 export HCMAI_RUNTIME_REMOTE='gdrive:HCMAI-2026/runtime'
 ```
 
@@ -93,11 +94,57 @@ cp .env.example .env
 # Edit only the fields this server needs; keep API keys private.
 ```
 
+For a local-only server, the only required `.env` fields are the four
+machine-specific paths above (or equivalent exported variables). Do **not**
+copy an old `.env` by Git or Drive. Recreate it from `.env.example`, then move
+only needed API keys via a secret manager or a protected SSH copy. The rclone
+configuration also contains a refresh token: configure a new `gdrive` remote
+on the server or transfer it through the same protected channel, never Git.
+
 Remote capabilities are role-separated: `TEXT_*` for rewriting, `VLM_*` for
 image-aware answering/reranking, and `EMBEDDING_*` for remote text embeddings.
 The offline competition default needs no API key. Provider configuration
 accepts only these role-specific keys; unsupported names are never translated
 or used as provider fallbacks.
+
+### Optional external fact grounding for Q&A
+
+`VQA_EXTERNAL_GROUNDING` is an integrated **query-planning** capability, not a
+source of submitted answers. When explicitly enabled for an online/API run,
+the allow-listed SearXNG source produces aliases, quotation variants and entity
+hypotheses. The pipeline then retrieves raw evidence from the local ASR/OCR
+indexes, joins it to the video timeline, and validates the final canonical
+`frame_idx`. A web snippet can never fill `answer` or `frame_id` by itself.
+
+It is disabled by default and rejected in offline or benchmark-strict runs.
+To exercise it, configure `VQA_EXTERNAL_ALLOWED_DOMAINS` in private `.env`.
+The default `VQA_EXTERNAL_SEARCH_BACKEND=searxng` additionally needs
+`VQA_EXTERNAL_SEARCH_URL`; use the explicit `ddg` backend when a self-hosted
+SearXNG service is unavailable (it uses the pinned `ddgs` package). Then opt
+in per run:
+
+```bash
+./scripts/competition.sh run ... --external-grounding
+```
+
+Use that option only if outbound lookup is permitted for the target deployment;
+the normal submission command omits it and remains corpus-local.
+
+For rare visual entities (logos, brands, mascots, toys), the independent
+`VQA_EXTERNAL_IMAGE_GROUNDING` branch implements the AIC-2025 QUEST pattern:
+SearXNG returns bounded web-image references, each reference is encoded by the
+local VKIS index, and only the resulting in-corpus video/frame candidates are
+allowed into Q&A. Configure `VQA_EXTERNAL_IMAGE_ALLOWED_DOMAINS`, or make the
+broader download decision explicitly with `VQA_EXTERNAL_IMAGE_ALLOW_ANY_HOST=1`.
+Then opt in independently:
+
+```bash
+./scripts/competition.sh run ... --external-image-grounding
+```
+
+The image branch automatically skips factual/ASR/OCR-contracted questions;
+it is reserved for visual OOK entities and records every source page in the
+runtime trace.
 
 Configure a personal/team `rclone` remote named `gdrive`, then inspect the
 local state first. `plan` makes no network call. `fetch --yes` is explicit,
@@ -111,6 +158,21 @@ uses checksum validation and refuses to overwrite unmanaged data.
   --artifact keyframes-k01-k05 --artifact keyframes-k06-k10 \
   --artifact keyframes-k11-k15 --artifact keyframes-k16-k20 \
   --artifact keyframes-l21-l25 --artifact keyframes-l26-l30
+
+# Model files are separate from the data manifest so they can live outside the
+# source checkout. The current Drive remote contains these exact directories.
+for model in bge-m3 Qwen2.5-VL-7B-Instruct; do
+  rclone copy --checksum --progress \
+    "$HCMAI_RUNTIME_REMOTE/models/$model" "/opt/hcmai-models/$model"
+done
+
+# Hydrate the two visual backbones once. This is setup-time only; switch back
+# to offline mode before any benchmark or competition run.
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 hf download \
+  --cache-dir "$HF_HUB_CACHE" timm/ViT-L-16-SigLIP2-256
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 hf download \
+  --cache-dir "$HF_HUB_CACHE" timm/ViT-SO400M-16-SigLIP2-384
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 ./scripts/competition.sh preflight --provider local --require-gpu \
   --require-modality-runtime --json-output results/preflight.json
@@ -127,7 +189,7 @@ offline-first.
 ./scripts/competition.sh preflight [options]
 ./scripts/competition.sh bootstrap plan|fetch [options]
 ./scripts/competition.sh run --queries QUERY.json --output OUT.json \
-  --answer-provider local --topk 20 --max-vlm-candidates 12
+  --answer-provider local --topk 20 --max-vlm-candidates 20
 ```
 
 An all-task smoke input is included, but needs the real runtime assets:
@@ -140,7 +202,10 @@ An all-task smoke input is included, but needs the real runtime assets:
 ```
 
 `--answer-provider openai` is explicit opt-in after a VLM provider is
-configured in `.env`; API usage is not a dependency of the local path.
+configured in `.env`; API usage is not a dependency of the local path. The
+remote adapter is OpenAI-compatible, so Lightning Model API can be configured
+with `VLM_BASE_URL=https://lightning.ai/api/v1`, a private Lightning key in
+`VLM_API_KEY`, and a vision-capable `VLM_MODEL` such as `openai/gpt-4o`.
 
 ## Rebuild indexes on a stronger server
 
@@ -210,12 +275,25 @@ python -m src.eval.asr_global_v2 --packs K01,L21 --execute --allow-network --con
   --output-dir data/index/asr_global_v3 --work-dir data/work/asr_global_v3 \
   --raw-dir data/asr_global_v3_raw --model /opt/models/bge-m3 --resume
 
+# Rebuild retrieval-resolution windows from existing Deepgram JSON only.
+# This never extracts media and never calls Deepgram; it prefers word
+# timestamps over coarse provider paragraphs.  Write a staged artifact first.
+python -m src.eval.asr_global_v2 --packs L21,L22,L23,L24,L25,L26,L27,L28,L29,L30 \
+  --raw-only --execute --canonical data/index/global_keyframes.parquet \
+  --raw-dir data/asr_global_v2_raw \
+  --output-dir data/index/modality_global_v3/asr_global_v2 \
+  --model /opt/models/bge-m3
+
 # Merge all completed K/L shards. Legacy K shards remain compatible, but are
 # no longer a mandatory dependency for a complete rebuild.
 python -m src.eval.asr_global_merge_v2 \
   --canonical data/index/global_keyframes.parquet \
-  --legacy-dir data/index --l-dir data/index/asr_global_v3 \
-  --output-dir data/index/modality_global_v3/asr_global_merged_v3
+  --legacy-dir data/index --l-dir data/index/modality_global_v3/asr_global_v2 \
+  --output-dir data/index/modality_global_v3/asr_global_merged_v2
+
+# After index preflight + benchmark pass, select the staged merged ASR source
+# for Q&A without overwriting the previous production artifact.
+VQA_ASR_GLOBAL_DIR=/opt/hcmai/data/index/modality_global_v3/asr_global_merged_v2
 ```
 
 ### 4. Rebuild OCR and text embeddings

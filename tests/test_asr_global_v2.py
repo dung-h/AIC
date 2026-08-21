@@ -97,6 +97,47 @@ def test_timestamped_chunks_are_deduplicated_and_sorted() -> None:
     ]
 
 
+def test_word_timestamps_preempt_a_coarse_paragraph_for_retrieval_precision() -> None:
+    words = [
+        {
+            "punctuated_word": "Hóa" if index == 13 else f"w{index}",
+            "start": index * 0.5,
+            "end": index * 0.5 + 0.4,
+        }
+        for index in range(28)
+    ]
+    words[14]["punctuated_word"] = "hồng"
+    words[15]["punctuated_word"] = "Nhật"
+    words[16]["punctuated_word"] = "Tảo"
+    payload = {
+        "results": {
+            "channels": [
+                {
+                    "alternatives": [
+                        {
+                            "words": words,
+                            "paragraphs": {
+                                "paragraphs": [
+                                    {
+                                        "sentences": [
+                                            {"text": "coarse paragraph", "start": 0.0, "end": 240.0}
+                                        ]
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    chunks = list(iter_timestamped_chunks(payload))
+    assert len(chunks) >= 2
+    assert all((chunk["end"] - chunk["start"]) <= 8.0 for chunk in chunks)
+    assert any("Hóa hồng Nhật Tảo" in chunk["text"] for chunk in chunks)
+    assert all(chunk["text"] != "coarse paragraph" for chunk in chunks)
+
+
 def test_default_run_is_dry_run_and_does_not_extract_or_call_provider(tmp_path: Path) -> None:
     archive_root = tmp_path / "archives"
     _write_video_zip(archive_root, "L21", ["L21_V001"])
@@ -216,6 +257,36 @@ def test_execute_is_resumable_and_materializes_canonical_frame_idx(tmp_path: Pat
     assert second["packs"]["L21"]["status"] == "complete"
     assert len(transcriber.calls) == 1  # raw JSON was reused; no second API/provider call
     assert len(ffmpeg_calls) == 1  # resumed raw JSON also avoids re-extracting audio
+
+
+def test_raw_only_rebuilds_existing_transcript_without_archive_or_provider(tmp_path: Path) -> None:
+    canonical = tmp_path / "canonical.parquet"
+    _write_canonical(canonical, ["L21_V001"])
+    raw = tmp_path / "raw" / "l21" / "L21_V001.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text(json.dumps({
+        "results": {"channels": [{"alternatives": [{"words": [
+            {"punctuated_word": "Nha", "start": 0.0, "end": 0.3},
+            {"punctuated_word": "Trang", "start": 0.3, "end": 0.7},
+        ]}]}]},
+    }), encoding="utf-8")
+    config = RunnerConfig(
+        archive_root=tmp_path / "missing_archives",
+        canonical_path=canonical,
+        output_dir=tmp_path / "output",
+        work_dir=tmp_path / "work",
+        raw_dir=tmp_path / "raw",
+        execute=True,
+        raw_only=True,
+    )
+    embedder = _FakeEmbedder()
+    report = ASRGlobalV2Runner(config, embedder=embedder).run(["L21"])
+
+    assert report["packs"]["L21"]["status"] == "complete"
+    assert report["preflight"]["raw_only"] is True
+    assert not (tmp_path / "work").exists()
+    chunks = pd.read_parquet(tmp_path / "output" / "asr_chunks_l21_ts.parquet")
+    assert chunks.loc[0, "text"] == "Nha Trang"
 
 
 def test_embedder_is_reused_across_pack_materialization(tmp_path: Path) -> None:

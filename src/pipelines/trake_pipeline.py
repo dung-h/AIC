@@ -1,5 +1,5 @@
 """
-TRAKE ASR fallback/diagnostic pipeline: query (chuỗi sub-events) → align trên
+TRAKE explicit ASR diagnostic pipeline: query (chuỗi sub-events) → align trên
 ASR chunks → frames.  The shared production entrypoint defaults to visual
 TRAKE; this module is selected only by an explicit ASR mode.
 
@@ -219,20 +219,65 @@ class TrakePipeline:
                 continue
             ac_v = self.ac[self.ac.vid == vid].copy()
             if len(ac_v) < N: continue
-            sort_columns = ["start", "end"]
+            # ASR chunks can share a canonical keyframe. Aligning directly
+            # over chunks lets DANTE select two different chunks that submit
+            # as the same frame; the old code then discarded the whole video
+            # after alignment. Build the DANTE axis from unique canonical
+            # frames instead, retaining the strongest supporting chunk for
+            # each event at each frame.
+            sort_columns = ["pts_time", "frame_idx", "start", "end"]
             if "chunk_index" in ac_v.columns:
                 sort_columns.append("chunk_index")
             if "embedding_row" in ac_v.columns:
                 sort_columns.append("embedding_row")
             ac_v = ac_v.sort_values(sort_columns).reset_index(drop=False)
             chunk_emb = self.ce[ac_v["index"].values]
-            S = ev_vecs @ chunk_emb.T  # [N events × T chunks]
-            score, path = dante_align(S, lam=lam)
+            chunk_scores = ev_vecs @ chunk_emb.T  # [N events × chunks]
+
+            frame_rows = []
+            selected_chunk_positions = []
+            for frame_idx, frame_group in ac_v.groupby("frame_idx", sort=False):
+                kf_values = {int(value) for value in frame_group["kf_n"]}
+                pts_values = {float(value) for value in frame_group["pts_time"]}
+                if len(kf_values) != 1 or len(pts_values) != 1:
+                    raise RuntimeError(
+                        "ASR chunks sharing a canonical frame disagree on "
+                        f"kf_n/pts_time for {vid}/{frame_idx}"
+                    )
+                positions = frame_group.index.to_numpy(dtype=np.int64)
+                scores_for_frame = chunk_scores[:, positions]
+                best_local = np.argmax(scores_for_frame, axis=1)
+                selected_chunk_positions.append(positions[best_local])
+                frame_rows.append(frame_group.iloc[0])
+
+            if len(frame_rows) < N:
+                continue
+            canonical_axis = pd.DataFrame(frame_rows).reset_index(drop=True)
+            timeline_times = canonical_axis["pts_time"].to_numpy(dtype=np.float64)
+            frame_ids = canonical_axis["frame_idx"].to_numpy(dtype=np.int64)
+            if (
+                not np.isfinite(timeline_times).all()
+                or np.any(timeline_times[1:] <= timeline_times[:-1])
+                or np.any(frame_ids[1:] <= frame_ids[:-1])
+            ):
+                # The shared ASR index normally prevents this. If a corrupt
+                # canonical projection slips through, never turn it into an
+                # unordered submission path.
+                continue
+            selected_chunk_positions = np.asarray(
+                selected_chunk_positions, dtype=np.int64
+            ).T  # [N events × unique canonical frames]
+            S = np.take_along_axis(
+                chunk_scores,
+                selected_chunk_positions,
+                axis=1,
+            )
+            score, path = dante_align(S, lam=lam, timeline_times=timeline_times)
             if path is None: continue
             path_rows = []
             valid_path = True
             for i, t in enumerate(path):
-                row = ac_v.iloc[t]
+                row = ac_v.iloc[int(selected_chunk_positions[i, t])]
                 if pd.isna(row.frame_idx) or pd.isna(row.kf_n):
                     valid_path = False
                     break
@@ -296,7 +341,9 @@ class VisualTrakePipeline:
         self._embed_provider = embed_provider
         self.last_timings_ms = {}
         if alignment_policy is None:
-            alignment_policy = os.getenv("TRAKE_VISUAL_ALIGNMENT_POLICY", "legacy")
+            # A direct use remains convenient for isolated legacy callers,
+            # but production always passes this value from RuntimePolicy.
+            alignment_policy = "legacy"
         visual_alignment_policy = str(alignment_policy).strip().lower()
         if visual_alignment_policy not in {"legacy", "lattice_v1", "multi_video_v1"}:
                 raise ValueError(
@@ -323,15 +370,6 @@ class VisualTrakePipeline:
             if visual_alignment_policy == "multi_video_v1"
             else "legacy"
         )
-        if candidate_video_limit is None and self.alignment_policy == "multi_video_v1":
-            raw_limit = os.getenv("TRAKE_VISUAL_CANDIDATE_VIDEO_LIMIT")
-            if raw_limit:
-                try:
-                    candidate_video_limit = int(raw_limit)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        "TRAKE_VISUAL_CANDIDATE_VIDEO_LIMIT must be a positive integer"
-                    ) from exc
         if candidate_video_limit is not None and (
             not isinstance(candidate_video_limit, int)
             or isinstance(candidate_video_limit, bool)
@@ -487,7 +525,9 @@ class MultimodalTrakePipeline:
             )
         self.retrievers = normalized
         if alignment_policy is None:
-            alignment_policy = os.getenv("TRAKE_ALIGNMENT_POLICY", "legacy")
+            # HCMAIPipeline supplies RuntimePolicy in production.  Keep a
+            # deterministic default for direct diagnostic construction.
+            alignment_policy = "legacy"
         alignment_policy = str(alignment_policy).strip().lower()
         self.aligner = EventLevelMultimodalDante(
             normalized,

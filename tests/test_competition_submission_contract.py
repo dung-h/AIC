@@ -12,6 +12,8 @@ import pytest
 
 from src.pipelines.codabench_submit import (
     format_aic26_query_csv,
+    load_production_canonical_registry,
+    validate_aic26_submission_zip,
     write_aic26_mixed_submission_zip,
     write_aic26_submission_zip,
 )
@@ -82,6 +84,37 @@ def test_zip_has_submission_root_and_official_query_filenames(tmp_path, canonica
         ]
         _, rows = _read_csv_member(bundle, "submission/query-1-qa.csv")
         assert rows == [["V2", "42", "mưa"]]
+
+
+def test_production_canonical_registry_accepts_shared_output_frame_but_not_duplicate_keyframe(tmp_path):
+    registry = tmp_path / "global_keyframes.parquet"
+    import pandas as pd
+    pd.DataFrame([
+        {"video_id": "V1", "kf_n": 1, "frame_idx": 10, "pts_time": 1.0},
+        {"video_id": "V1", "kf_n": 2, "frame_idx": 10, "pts_time": 1.1},
+    ]).to_parquet(registry, index=False)
+
+    pairs, report = load_production_canonical_registry(registry)
+
+    assert pairs == {("V1", 10)}
+    assert report["row_count"] == 2
+    assert report["unique_output_pairs"] == 1
+
+    pd.DataFrame([
+        {"video_id": "V1", "kf_n": 1, "frame_idx": 10, "pts_time": 1.0},
+        {"video_id": "V1", "kf_n": 1, "frame_idx": 20, "pts_time": 2.0},
+    ]).to_parquet(registry, index=False)
+    with pytest.raises(RuntimeError, match="duplicates keyframe"):
+        load_production_canonical_registry(registry)
+
+
+def test_official_zip_self_validation_rejects_noncanonical_member(tmp_path, canonical):
+    output = tmp_path / "answer.zip"
+    write_aic26_submission_zip(
+        "kis", {"1": [{"video_id": "V1", "frame_idx": 10}]}, output,
+        canonical_frames=canonical,
+    )
+    assert validate_aic26_submission_zip(output, canonical_frames=canonical)["row_count"] == 1
 
 
 def test_mixed_zip_contains_all_three_tasks_and_preserves_rank_order(tmp_path, canonical):
@@ -155,6 +188,37 @@ def test_qa_rejects_empty_overlong_and_more_than_100_rows(canonical):
             "1",
             [{**base, "answer": str(index)} for index in range(101)],
             canonical_frames=canonical,
+        )
+
+
+@pytest.mark.parametrize("answer", ["unknown", "placeholder", "evidence-only", "cannot answer"])
+def test_official_qa_rejects_placeholder_answers(canonical, answer):
+    with pytest.raises(ValueError, match="placeholder"):
+        format_aic26_query_csv(
+            "qa", "1", [{"video_id": "V2", "frame_id": 42, "answer": answer}],
+            canonical_frames=canonical,
+        )
+
+
+@pytest.mark.parametrize(
+    ("task", "answers", "event_count"),
+    [
+        ("kis", [{"video_id": "V1", "frame_idx": 10}, {"video_id": "V1", "frame_idx": 10}], None),
+        ("qa", [
+            {"video_id": "V1", "frame_id": 10, "answer": "mưa"},
+            {"video_id": "V1", "frame_id": 10, "answer": "nắng"},
+        ], None),
+        ("trake", [
+            {"video_id": "V1", "frame_ids": [10, 30]},
+            {"video_id": "V1", "frame_ids": [10, 30]},
+        ], 2),
+    ],
+)
+def test_official_transport_rejects_duplicate_ranked_answers(
+        canonical, task, answers, event_count):
+    with pytest.raises(ValueError, match="duplicate"):
+        format_aic26_query_csv(
+            task, "1", answers, canonical_frames=canonical, event_count=event_count,
         )
 
 

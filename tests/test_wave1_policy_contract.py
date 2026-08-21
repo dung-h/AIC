@@ -19,6 +19,23 @@ def test_legacy_default_policy_remains_local_and_online() -> None:
     assert policy.vqa_answer_provider == "local"
     assert policy.kis_remote_translation is False
     assert policy.trake_remote_embeddings is False
+    assert policy.trake_visual_alignment_policy == "legacy"
+    assert policy.trake_visual_candidate_video_limit is None
+
+
+def test_trake_alignment_knobs_are_validated_at_runtime_policy_boundary(monkeypatch) -> None:
+    monkeypatch.setenv("HCMAI_TRAKE_VISUAL_ALIGNMENT_POLICY", "multi_video_v1")
+    monkeypatch.setenv("HCMAI_TRAKE_VISUAL_CANDIDATE_VIDEO_LIMIT", "20")
+    monkeypatch.setenv("HCMAI_TRAKE_MULTIMODAL_ALIGNMENT_POLICY", "multi_video_v1")
+
+    policy = RuntimePolicy.from_env()
+
+    assert policy.trake_visual_alignment_policy == "multi_video_v1"
+    assert policy.trake_visual_candidate_video_limit == 20
+    assert policy.trake_multimodal_alignment_policy == "multi_video_v1"
+
+    with pytest.raises(ValueError, match="TRAKE visual alignment"):
+        RuntimePolicy(trake_visual_alignment_policy="unmeasured")
 
 
 @pytest.mark.parametrize(
@@ -93,8 +110,75 @@ def test_online_production_may_explicitly_select_remote_answer_provider() -> Non
     assert policy.network_mode == "online"
 
 
+def test_external_grounding_is_explicit_online_capability_with_allowlisted_sources() -> None:
+    policy = RuntimePolicy(
+        network_mode="online",
+        vqa_external_grounding=True,
+        vqa_external_search_url="https://search.example.org",
+        vqa_external_allowed_domains=("example.org",),
+    )
+
+    assert policy.vqa_external_grounding is True
+    assert policy.vqa_external_allowed_domains == ("example.org",)
+
+    with pytest.raises(ValueError, match="VQA_EXTERNAL_SEARCH_URL"):
+        RuntimePolicy(network_mode="online", vqa_external_grounding=True)
+
+    with pytest.raises(ValueError, match="forbids external VQA grounding"):
+        RuntimePolicy(
+            execution_mode="benchmark_strict",
+            vqa_external_grounding=True,
+            vqa_external_search_url="https://search.example.org",
+            vqa_external_allowed_domains=("example.org",),
+        )
+
+
+def test_hypothesis_and_semantic_verifier_are_explicit_online_capabilities() -> None:
+    policy = RuntimePolicy(
+        network_mode="online",
+        vqa_external_grounding=True,
+        vqa_external_search_url="https://search.example.org",
+        vqa_external_allowed_domains=("example.org",),
+        vqa_hypothesis_generation=True,
+        vqa_semantic_evidence_verifier=True,
+    )
+
+    assert policy.vqa_hypothesis_generation is True
+    assert policy.vqa_semantic_evidence_verifier is True
+
+    with pytest.raises(ValueError, match="requires vqa_external_grounding"):
+        RuntimePolicy(network_mode="online", vqa_hypothesis_generation=True)
+
+    with pytest.raises(ValueError, match="hypothesis/evidence verification"):
+        RuntimePolicy(
+            execution_mode="benchmark_strict",
+            vqa_semantic_evidence_verifier=True,
+        )
+
+
+def test_ddg_image_grounding_does_not_require_a_self_hosted_search_url() -> None:
+    policy = RuntimePolicy(
+        network_mode="online",
+        vqa_external_search_backend="ddg",
+        vqa_external_image_grounding=True,
+        vqa_external_image_allow_any_host=True,
+    )
+
+    assert policy.vqa_external_search_url == ""
+    assert policy.vqa_external_search_backend == "ddg"
+    assert policy.vqa_external_image_grounding is True
+
+
 def test_competition_local_vlm_defaults_to_four_bit() -> None:
     assert RuntimePolicy().local_vlm_load_in_4bit is True
+
+
+def test_vqa_asr_global_dir_is_an_explicit_promotion_switch(monkeypatch) -> None:
+    monkeypatch.setenv("VQA_ASR_GLOBAL_DIR", "/srv/aic/asr_global_v3")
+
+    policy = RuntimePolicy.from_env()
+
+    assert policy.vqa_asr_global_dir == "/srv/aic/asr_global_v3"
 
 
 def test_override_revalidates_the_network_boundary_without_mutating_base() -> None:

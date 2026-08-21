@@ -1012,11 +1012,23 @@ class OpenAICompatibleAnswerProvider(AnswerProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
         payload = self._payload(request)
 
-        def operation() -> Mapping[str, Any]:
-            return self.transport(self.endpoint, headers, payload, self.timeout_s)
+        def operation() -> Any:
+            response_payload = self.transport(self.endpoint, headers, payload, self.timeout_s)
+            try:
+                return _extract_chat_content(response_payload)
+            except AnswerProviderSchemaError as exc:
+                # Some OpenAI-compatible vision gateways intermittently emit
+                # an otherwise valid choice with empty content.  It carries no
+                # answer and is safe to retry once under the existing bounded
+                # policy.  Other schema failures remain fail-closed.
+                if str(exc) == "API response has empty content":
+                    raise AnswerProviderRequestError(
+                        "remote API returned empty content", retryable=True
+                    ) from None
+                raise
 
         try:
-            response_payload = _run_with_retry(
+            content = _run_with_retry(
                 operation,
                 retry_policy=self.retry_policy,
                 wrap_error=lambda exc: AnswerProviderRequestError(
@@ -1024,7 +1036,6 @@ class OpenAICompatibleAnswerProvider(AnswerProvider):
                     retryable=isinstance(exc, (TimeoutError, OSError, URLError)),
                 ),
             )
-            content = _extract_chat_content(response_payload)
             structured = _extract_json_object(content)
             elapsed = (time.perf_counter() - started) * 1000
             return AnswerProviderResponse.from_mapping(

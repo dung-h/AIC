@@ -11,7 +11,7 @@ Important semantics:
 * duplicate frame/evidence hits do not create extra RRF votes;
 * a missing or empty ASR/OCR channel contributes no term and no penalty;
 * specialist-only videos can enter the visual top-k only through the explicit
-  evidence/rank rescue gate;
+  evidence/rank rescue gate, including a bounded lexical/quote-evidence path;
 * all ties have a deterministic video-id tie-break.
 """
 from __future__ import annotations
@@ -57,7 +57,8 @@ def _object_to_mapping(candidate: Candidate, *, video_key: str) -> dict[str, obj
     for name in (
         video_key, "video_id", "frame_idx", "kf_n", "pts_time", "score", "rank",
         "evidence", "text", "asr_text", "ocr_text", "transcript", "metadata",
-        "channel", "modality", "source",
+        "channel", "modality", "source", "view_provenance", "lexical_provenance",
+        "quote_provenance", "retrieval_provenance", "match_type", "evidence_type",
     ):
         if hasattr(candidate, name):
             payload[name] = getattr(candidate, name)
@@ -148,14 +149,23 @@ def weighted_video_rrf(
     ),
     specialist_rescue_enabled: bool = True,
     allow_single_strong_rescue: bool = True,
+    evidence_aware_rescue_enabled: bool = True,
+    evidence_aware_max_rank: int = 20,
+    provenance_max_rank: int = 3,
+    provenance_min_score: float = 0.8,
+    provenance_modes: Sequence[str] = (
+        "bm25_coverage", "lexical_exact", "exact", "exact_match",
+        "quote", "quoted_fact",
+    ),
 ) -> list[dict]:
     """Fuse ranked channel hits with weighted reciprocal rank fusion.
 
     ``topk`` is both the output budget and the visual-anchor boundary used by
     the rescue policy.  All channels are unioned before scoring, but a
     specialist-only video is eligible to displace the visual boundary only if
-    its configured rank/evidence gate passes.  This keeps weak ASR/OCR noise
-    from evicting visual candidates while still allowing genuine rescue.
+    its configured rank/evidence gate passes. This keeps weak ASR/OCR noise
+    from evicting visual candidates while still allowing a lower-ranked,
+    explicitly grounded lexical/quote hit to rescue.
 
     A channel that is absent, empty, or has a non-positive weight contributes
     nothing.  It is never represented as a zero score or a penalty, which is
@@ -167,10 +177,25 @@ def weighted_video_rrf(
         return []
     if specialist_strong_rank < 1 or specialist_support_rank < 1:
         raise ValueError("specialist rank thresholds must be positive")
+    if evidence_aware_max_rank < 1 or provenance_max_rank < 1:
+        raise ValueError("evidence-aware provenance ranks must be positive")
     if min_specialist_channels < 1:
         raise ValueError("min_specialist_channels must be positive")
     if require_specialist_evidence and not evidence_keys:
         raise ValueError("evidence_keys cannot be empty when evidence is required")
+    try:
+        provenance_min_score = float(provenance_min_score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("provenance_min_score must be numeric") from exc
+    if not isfinite(provenance_min_score):
+        raise ValueError("provenance_min_score must be finite")
+    normalized_provenance_modes = tuple(
+        dict.fromkeys(
+            str(mode).strip().lower() for mode in provenance_modes if str(mode).strip()
+        )
+    )
+    if evidence_aware_rescue_enabled and not normalized_provenance_modes:
+        raise ValueError("provenance_modes cannot be empty when evidence-aware rescue is enabled")
 
     # Normalize channel names once.  This makes mappings with non-string keys
     # behave the same as the public string-key API and makes channel iteration
@@ -209,6 +234,7 @@ def weighted_video_rrf(
         )
 
     specialist_ranks: dict[str, dict[str, int]] = {}
+    evidence_aware_hits: dict[str, dict[str, str]] = {}
     for channel in specialist_names:
         collapsed = collapse_video_ranks(materialized_channels[channel])
         for video_id, item in collapsed.items():
@@ -220,36 +246,92 @@ def weighted_video_rrf(
                 evidence_keys=evidence_keys,
             ):
                 specialist_ranks.setdefault(video_id, {})[channel] = int(item["rank"])
+                if (
+                    evidence_aware_rescue_enabled
+                    and int(item["rank"]) <= int(evidence_aware_max_rank)
+                ):
+                    reason = _evidence_aware_rescue_reason(
+                        item,
+                        provenance_max_rank=int(provenance_max_rank),
+                        provenance_min_score=provenance_min_score,
+                        provenance_modes=normalized_provenance_modes,
+                    )
+                    if reason is not None:
+                        evidence_aware_hits.setdefault(video_id, {})[channel] = reason
 
     visual_top_ids = set(visual_order[:topk])
-    strong_rescue_ids: set[str] = set()
+    rescue_reasons: dict[str, str] = {}
+    # A specialist vote may reorder a video that the visual channel already
+    # admitted, but only after it clears the same bounded evidence gate used
+    # for a rescue.  Previously the visual guard returned the raw visual order
+    # whenever there was no *new* specialist-only video; ASR/OCR therefore had
+    # no ranking effect at all for visual top-k candidates.
+    specialist_scoring_ids: set[str] = set()
     for video_id, per_channel in specialist_ranks.items():
-        if video_id in visual_top_ids:
-            continue
         has_top_hit = any(rank <= specialist_strong_rank for rank in per_channel.values())
         supporting_channels = sum(
             rank <= specialist_support_rank for rank in per_channel.values()
         )
+        evidence_reasons = evidence_aware_hits.get(video_id, {})
+        specialist_gate_passed = (
+            (allow_single_strong_rescue and has_top_hit)
+            or supporting_channels >= min_specialist_channels
+            or bool(evidence_reasons)
+        )
+        if specialist_gate_passed:
+            specialist_scoring_ids.add(video_id)
+        if video_id in visual_top_ids:
+            continue
         if (
             (allow_single_strong_rescue and has_top_hit)
             or supporting_channels >= min_specialist_channels
         ):
-            strong_rescue_ids.add(video_id)
+            rescue_reasons[video_id] = "strong_rank"
+            continue
+        if evidence_reasons:
+            # One explicit, locally-grounded rare fact/quote is enough to
+            # rescue. The provenance gate above makes this stricter than a raw
+            # non-empty transcript/OCR string.
+            channel, reason = sorted(
+                evidence_reasons.items(), key=lambda item: _channel_sort_key(item[0])
+            )[0]
+            rescue_reasons[video_id] = f"evidence_aware:{channel}:{reason}"
 
-    # Without an eligible rescue, retain the visual top-k exactly.  Specialist
-    # evidence can still be present for a video already in that boundary, but
-    # it must not reorder/demote the visual anchor on weak evidence.
-    if not strong_rescue_ids:
-        return _visual_baseline_rows(visual_ranks, visual_order, topk, rrf_k=rrf_k)
-
-    allowed_ids = visual_top_ids | strong_rescue_ids
+    allowed_ids = visual_top_ids | set(rescue_reasons)
+    # Keep weak/non-provenanced specialist rows out of the RRF scorer even
+    # when their video is already visual-admitted. This separates inclusion
+    # (visual top-k plus gated rescues) from ranking (weighted RRF on trusted
+    # votes) and prevents incidental transcript/OCR text from perturbing the
+    # visual baseline.
+    scoring_channels = {visual_name: visual_candidates}
+    for channel in specialist_names:
+        trusted_rows = []
+        # Preserve the channel-global rank before filtering.  Re-enumerating
+        # only trusted rows would turn a source rank of 16 into rank 1 and
+        # falsely amplify a late rescue in RRF.
+        for stream_position, row in enumerate(materialized_channels[channel], 1):
+            payload = _object_to_mapping(row, video_key="video_id")
+            video_id = str(payload.get("video_id", "")).strip()
+            if video_id not in specialist_scoring_ids:
+                continue
+            payload["rank"] = _positive_rank(payload.get("rank")) or stream_position
+            trusted_rows.append(payload)
+        scoring_channels[channel] = trusted_rows
+    guard_mode = (
+        "strong_specialist_rescue"
+        if rescue_reasons and all(reason == "strong_rank" for reason in rescue_reasons.values())
+        else "evidence_aware_specialist_rescue"
+    )
+    if not rescue_reasons:
+        guard_mode = "visual_boundary_rrf"
     return _fuse_unrestricted(
-        materialized_channels,
+        scoring_channels,
         positive_channels,
         rrf_k=rrf_k,
         topk=topk,
         allowed_video_ids=allowed_ids,
-        guard_mode="strong_specialist_rescue",
+        guard_mode=guard_mode,
+        rescue_reasons=rescue_reasons,
     )
 
 
@@ -301,6 +383,71 @@ def _has_nonempty_evidence(value: object) -> bool:
     return True
 
 
+def _evidence_aware_rescue_reason(
+    candidate: Mapping[str, object],
+    *,
+    provenance_max_rank: int,
+    provenance_min_score: float,
+    provenance_modes: Sequence[str],
+) -> str | None:
+    """Return a traceable reason for a high-confidence lexical/quote hit.
+
+    ``QNAModalityRouter.global_candidates_multi`` emits ``view_provenance``
+    records such as ``bm25_coverage``. We require a recognized mode, a
+    top-ranked lexical/quote view, and a bounded quality score. Explicit
+    exact/quote modes may omit a numeric score because their match type is the
+    provenance assertion.
+    """
+    for provenance in _iter_provenance_records(candidate):
+        mode = str(
+            provenance.get("score_mode", provenance.get("mode", provenance.get("match_type", "")))
+        ).strip().lower()
+        if mode not in provenance_modes:
+            continue
+        rank = _positive_rank(provenance.get("rank"))
+        if rank is None or rank > provenance_max_rank:
+            continue
+        if _mode_is_explicit_fact(mode):
+            return f"{mode}:rank_{rank}"
+        raw_score = provenance.get("score", provenance.get("coverage"))
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+        if isfinite(score) and score >= provenance_min_score:
+            return f"{mode}:rank_{rank}:score_{score:.3f}"
+    return None
+
+
+def _iter_provenance_records(candidate: Mapping[str, object]) -> Iterable[Mapping[str, object]]:
+    """Yield deterministic provenance mappings from a hit and its metadata."""
+    sources: list[object] = [
+        candidate.get("view_provenance"),
+        candidate.get("lexical_provenance"),
+        candidate.get("quote_provenance"),
+        candidate.get("retrieval_provenance"),
+    ]
+    metadata = candidate.get("metadata")
+    if isinstance(metadata, Mapping):
+        sources.extend(
+            metadata.get(key) for key in (
+                "view_provenance", "lexical_provenance", "quote_provenance",
+                "retrieval_provenance",
+            )
+        )
+    for source in sources:
+        if isinstance(source, Mapping):
+            yield source
+        elif isinstance(source, Sequence) and not isinstance(source, (str, bytes, bytearray)):
+            for item in source:
+                if isinstance(item, Mapping):
+                    yield item
+
+
+def _mode_is_explicit_fact(mode: str) -> bool:
+    return mode in {"lexical_exact", "exact", "exact_match", "quote", "quoted_fact"}
+
+
 def _visual_baseline_rows(
     visual_ranks: dict[str, dict],
     visual_order: list[str],
@@ -315,6 +462,7 @@ def _visual_baseline_rows(
         item["video_rank"] = rank
         item["rrf_score"] = 1.0 / (int(item["rank"]) + rrf_k)
         item["rrf_guard"] = "visual_baseline"
+        item["rrf_guard_reason"] = "no_eligible_specialist_rescue"
         output.append(item)
     return output
 
@@ -346,6 +494,7 @@ def _fuse_unrestricted(
     topk: int,
     allowed_video_ids: set[str] | None = None,
     guard_mode: str = "none",
+    rescue_reasons: Mapping[str, str] | None = None,
 ) -> list[dict]:
     """Compute RRF over the channel union after any rescue filter."""
     fused: dict[str, float] = {}
@@ -371,15 +520,18 @@ def _fuse_unrestricted(
         fused,
         key=lambda video_id: (-fused[video_id], str(video_id)),
     )[:topk]
-    return [
-        {
+    output = []
+    for rank, video_id in enumerate(order, 1):
+        row = {
             **metadata[video_id],
             "rrf_score": float(fused[video_id]),
             "video_rank": rank,
             "rrf_guard": guard_mode,
         }
-        for rank, video_id in enumerate(order, 1)
-    ]
+        if rescue_reasons is not None:
+            row["rrf_guard_reason"] = rescue_reasons.get(video_id, "visual_anchor")
+        output.append(row)
+    return output
 
 
 __all__ = ["collapse_video_ranks", "weighted_video_rrf"]

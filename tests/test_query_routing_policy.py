@@ -32,8 +32,8 @@ def test_annotation_types_resolve_to_explicit_five_plan_names():
     ("question_type", "primary", "channels"),
     [
         ("visual", "visual", ("visual",)),
-        ("spoken_fact", "asr", ("visual", "asr")),
-        ("screen_text", "ocr", ("visual", "ocr")),
+        ("spoken_fact", "asr", ("visual", "asr", "ocr", "poetry")),
+        ("screen_text", "ocr", ("visual", "asr", "ocr")),
         ("temporal_relation", "visual", ("visual", "asr", "ocr")),
         ("unknown", "visual", ("visual", "asr", "ocr")),
     ],
@@ -69,6 +69,7 @@ def test_weights_are_taken_from_config_and_visible_in_plan():
     )
     plan = build_routing_plan("spoken_fact", config)
     assert dict(plan.weights) == {"visual": 0.2, "asr": 1.7}
+    assert plan.required_channels == ("visual", "asr")
 
 
 def test_routing_off_ignores_specialists_and_preserves_visual_order():

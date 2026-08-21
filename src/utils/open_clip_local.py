@@ -1,4 +1,4 @@
-"""Offline-safe OpenCLIP tokenizer resolution.
+"""Offline-safe OpenCLIP model and tokenizer resolution.
 
 The persisted SigLIP2 cache contains tokenizer files and weights, but not
 necessarily the Hub ``config.json`` that OpenCLIP's built-in tokenizer lookup
@@ -21,7 +21,11 @@ def _hub_cache_root() -> Path:
 
 
 def cached_snapshot(model_name: str, *, cache_root: str | Path | None = None) -> Path | None:
-    """Return a complete local HF snapshot for one OpenCLIP model, if present."""
+    """Return a tokenizer-complete local HF snapshot, if present.
+
+    This deliberately does not contact Hugging Face.  It is useful for the
+    tokenizer, whose only required artifacts are the tokenizer files.
+    """
 
     repo_id = model_name if "/" in model_name else f"timm/{model_name}"
     root = Path(cache_root).expanduser() if cache_root is not None else _hub_cache_root()
@@ -38,6 +42,25 @@ def cached_snapshot(model_name: str, *, cache_root: str | Path | None = None) ->
     return candidates[0] if candidates else None
 
 
+def cached_model_snapshot(model_name: str, *, cache_root: str | Path | None = None) -> Path | None:
+    """Return a complete local OpenCLIP snapshot with config and weights.
+
+    ``open_clip.create_model_and_transforms(name, pretrained="webli")`` uses
+    the Hub resolver even when the matching snapshot is already cached.  The
+    production retriever must instead load the snapshot via OpenCLIP's
+    ``local-dir:`` schema so its model identity and offline behaviour are
+    deterministic.
+    """
+
+    snapshot = cached_snapshot(model_name, cache_root=cache_root)
+    if snapshot is None:
+        return None
+    required = ("open_clip_config.json", "open_clip_model.safetensors")
+    if not all((snapshot / filename).is_file() for filename in required):
+        return None
+    return snapshot
+
+
 def get_tokenizer(open_clip_module, model_name: str):
     """Build a tokenizer without a network request when the snapshot exists."""
 
@@ -49,4 +72,27 @@ def get_tokenizer(open_clip_module, model_name: str):
     return open_clip_module.get_tokenizer(model_name)
 
 
-__all__ = ["cached_snapshot", "get_tokenizer"]
+def create_model_and_transforms_local(open_clip_module, model_name: str):
+    """Load an OpenCLIP model only from its complete local snapshot.
+
+    A missing snapshot is a configuration error.  Do not fall back to the Hub:
+    silently downloading a new checkpoint makes offline runs non-reproducible
+    and can change the model behind persisted embedding indexes.
+    """
+
+    snapshot = cached_model_snapshot(model_name)
+    if snapshot is None:
+        raise FileNotFoundError(
+            "Local OpenCLIP snapshot is required for offline retrieval but is "
+            f"missing or incomplete: {model_name}. Expected a Hugging Face cache "
+            "snapshot containing open_clip_config.json and open_clip_model.safetensors."
+        )
+    return open_clip_module.create_model_and_transforms(f"local-dir:{snapshot}")
+
+
+__all__ = [
+    "cached_snapshot",
+    "cached_model_snapshot",
+    "create_model_and_transforms_local",
+    "get_tokenizer",
+]

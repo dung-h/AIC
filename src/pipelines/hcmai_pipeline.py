@@ -11,7 +11,7 @@ Pipelines:
 - KIS = KISFusionRetriever (ViT-L + SO400M SigLIP2 fusion; remote translation opt-in)
 - VKIS = VKISPipeline (SigLIP2 image encoder, measured hybrid0.5 selector)
 - VQA = VQAPipelineV3 (visual retrieval + optional global ASR/OCR + local VLM)
-- TRAKE = VisualTrakePipeline/DANTE by default; ASR is an explicit fallback
+- TRAKE = VisualTrakePipeline/DANTE by default; ASR is an explicit alternate diagnostic mode
 
 Lazy-load: chỉ load pipeline cần thiết.
 """
@@ -76,9 +76,11 @@ class HCMAIPipeline:
             overrides["vkis_selector"] = str(default_vkis_selector).strip().lower()
         self._policy = base_policy.override(**overrides)
         self.policy = self._policy
+        self._artifact_preflight_error = None
         try:
             artifact_snapshot = build_catalog_preflight().snapshot()
         except Exception as exc:
+            self._artifact_preflight_error = f"{type(exc).__name__}: {exc}"
             artifact_snapshot = {"preflight": {"ready": False, "reason": str(exc)}}
         self.context = RuntimeContext.from_policy(
             self._policy, artifact_snapshot=artifact_snapshot
@@ -96,6 +98,14 @@ class HCMAIPipeline:
         self._vqa_modality_routing = self._policy.vqa_modality_routing
         self._vqa_modality_router = None
         self._vqa_modality_routers = {}
+        self._vqa_grounding_resolver = None
+        self._vqa_grounding_resolver_spec = None
+        self._vqa_image_grounding_provider = None
+        self._vqa_image_grounding_provider_spec = None
+        self._vqa_hypothesis_generator = None
+        self._vqa_hypothesis_generator_spec = None
+        self._vqa_semantic_evidence_judge = None
+        self._vqa_semantic_evidence_judge_spec = None
 
     @property
     def _offline_locked(self) -> bool:
@@ -126,6 +136,15 @@ class HCMAIPipeline:
         )
 
     def _begin_trace(self, task: str, owner: str) -> FlowTrace:
+        # A production request must not limp into a model load with a failed
+        # startup catalog preflight. Interactive/research callers retain the
+        # diagnostic snapshot, but strict runs expose the root cause at the
+        # entrypoint rather than as a late missing-index/model symptom.
+        if self.context.strict and self._artifact_preflight_error is not None:
+            raise RuntimeError(
+                "production artifact preflight failed before request execution: "
+                + self._artifact_preflight_error
+            )
         trace = FlowTrace(task=task, context=self._new_request_context(), owner=owner)
         self.last_trace = trace
         return trace
@@ -160,10 +179,13 @@ class HCMAIPipeline:
     def _ensure_vqa(self):
         if self._vqa is None:
             from vqa_pipeline_v3 import VQAPipelineV3
+            vqa_kwargs = {
+                "translate": False if self._offline_locked else self._kis_remote_translation,
+            }
+            if self._policy.vqa_asr_global_dir:
+                vqa_kwargs["asr_global_dir"] = self._policy.vqa_asr_global_dir
             try:
-                self._vqa = VQAPipelineV3(
-                    translate=False if self._offline_locked else self._kis_remote_translation
-                )
+                self._vqa = VQAPipelineV3(**vqa_kwargs)
             except TypeError as exc:
                 # Preserve lightweight dependency injection used by local
                 # smoke tests/providers whose constructor has no translate
@@ -210,6 +232,8 @@ class HCMAIPipeline:
                     "translate": False,
                     "answer_provider": provider,
                 }
+                if self._policy.vqa_asr_global_dir:
+                    vqa_kwargs["asr_global_dir"] = self._policy.vqa_asr_global_dir
                 if shared_kis is not None:
                     vqa_kwargs["kis_retriever"] = shared_kis
                 try:
@@ -303,10 +327,172 @@ class HCMAIPipeline:
                 model_dir=model_dir,
                 strict=True,
                 active_modalities=requested,
+                asr_global_dir=self._policy.vqa_asr_global_dir,
             )
             self._vqa_modality_routers[requested] = router
         self._vqa_modality_router = router
         return router
+
+    def _ensure_vqa_grounding_resolver(self, enabled: bool):
+        """Return an explicit external-hypothesis resolver, never a fallback.
+
+        The resolver is deliberately composed here instead of inside the VQA
+        model or retriever.  That makes outbound network use visible in the
+        public entrypoint and keeps every final answer grounded by local
+        ASR/OCR/visual evidence plus a canonical frame map.
+        """
+        from src.vqa.grounding import (
+            DisabledGroundingResolver,
+            DuckDuckGoGroundingResolver,
+            SearxNGGroundingResolver,
+        )
+
+        if not enabled:
+            return DisabledGroundingResolver()
+        if self._offline_locked:
+            raise RuntimeError("offline Q&A cannot enable external grounding")
+        spec = (
+            self._policy.vqa_external_search_backend,
+            self._policy.vqa_external_search_url,
+            self._policy.vqa_external_allowed_domains,
+            self._policy.vqa_external_timeout_seconds,
+        )
+        if not spec[2] or (spec[0] == "searxng" and not spec[1]):
+            raise RuntimeError(
+                "external text grounding requires VQA_EXTERNAL_ALLOWED_DOMAINS and, "
+                "for the SearXNG backend, VQA_EXTERNAL_SEARCH_URL in the shared .env"
+            )
+        if self._vqa_grounding_resolver is not None:
+            if self._vqa_grounding_resolver_spec != spec:
+                raise RuntimeError(
+                    "external grounding is already initialized with a different "
+                    "search configuration; create a new HCMAIPipeline"
+                )
+            return self._vqa_grounding_resolver
+        if spec[0] == "ddg":
+            self._vqa_grounding_resolver = DuckDuckGoGroundingResolver(
+                allowed_domains=spec[2], timeout_seconds=spec[3]
+            )
+        else:
+            self._vqa_grounding_resolver = SearxNGGroundingResolver(
+                spec[1], allowed_domains=spec[2], timeout_seconds=spec[3]
+            )
+        self._vqa_grounding_resolver_spec = spec
+        return self._vqa_grounding_resolver
+
+    def _ensure_vqa_image_grounding_provider(self, enabled: bool):
+        """Build the explicit web-image → local-VKIS capability on demand."""
+        from src.vqa.image_grounding import (
+            DisabledImageGroundingProvider,
+            DuckDuckGoImageGroundingProvider,
+            SearxNGImageGroundingProvider,
+        )
+
+        if not enabled:
+            return DisabledImageGroundingProvider()
+        if self._offline_locked:
+            raise RuntimeError("offline Q&A cannot enable external image grounding")
+        spec = (
+            self._policy.vqa_external_search_backend,
+            self._policy.vqa_external_search_url,
+            self._policy.vqa_external_image_allowed_domains,
+            self._policy.vqa_external_image_allow_any_host,
+            self._policy.vqa_external_timeout_seconds,
+            self._policy.vqa_external_image_max_references,
+        )
+        if (spec[0] == "searxng" and not spec[1]) or (not spec[2] and not spec[3]):
+            raise RuntimeError(
+                "external image grounding requires VQA_EXTERNAL_IMAGE_ALLOWED_DOMAINS (or explicit "
+                "VQA_EXTERNAL_IMAGE_ALLOW_ANY_HOST=true) in the shared .env"
+            )
+        if self._vqa_image_grounding_provider is not None:
+            if self._vqa_image_grounding_provider_spec != spec:
+                raise RuntimeError(
+                    "external image grounding is already initialized with a different "
+                    "search configuration; create a new HCMAIPipeline"
+                )
+            return self._vqa_image_grounding_provider
+        if spec[0] == "ddg":
+            self._vqa_image_grounding_provider = DuckDuckGoImageGroundingProvider(
+                allowed_domains=spec[2],
+                allow_any_image_host=spec[3],
+                vkis_factory=self._ensure_vkis,
+                timeout_seconds=spec[4],
+                max_references=spec[5],
+            )
+        else:
+            self._vqa_image_grounding_provider = SearxNGImageGroundingProvider(
+                spec[1],
+                allowed_domains=spec[2],
+                allow_any_image_host=spec[3],
+                vkis_factory=self._ensure_vkis,
+                timeout_seconds=spec[4],
+                max_references=spec[5],
+            )
+        self._vqa_image_grounding_provider_spec = spec
+        return self._vqa_image_grounding_provider
+
+    def _ensure_vqa_hypothesis_generator(self, enabled: bool):
+        """Build the explicit online planner; it has no implicit fallback."""
+        from src.vqa.hypothesis_generator import (
+            DisabledHypothesisGenerator,
+            OpenAICompatibleHypothesisGenerator,
+        )
+
+        if not enabled:
+            return DisabledHypothesisGenerator()
+        if self._offline_locked:
+            raise RuntimeError("offline Q&A cannot enable hypothesis generation")
+        from src.core.providers import provider_for
+        config = provider_for("vision")
+        if not config.configured:
+            raise RuntimeError(
+                "hypothesis generation requires VLM_BASE_URL, VLM_API_KEY and VLM_MODEL"
+            )
+        spec = (config.base_url, config.model)
+        if self._vqa_hypothesis_generator is not None:
+            if self._vqa_hypothesis_generator_spec != spec:
+                raise RuntimeError(
+                    "hypothesis generator is already initialized with a different provider; "
+                    "create a new HCMAIPipeline"
+                )
+            return self._vqa_hypothesis_generator
+        self._vqa_hypothesis_generator = OpenAICompatibleHypothesisGenerator(
+            config.base_url, config.model, api_key=config.api_key
+        )
+        self._vqa_hypothesis_generator_spec = spec
+        return self._vqa_hypothesis_generator
+
+    def _ensure_vqa_semantic_evidence_judge(self, enabled: bool):
+        """Build the independent candidate verifier for an explicit online run."""
+        from src.vqa.semantic_evidence import (
+            DisabledSemanticEvidenceJudge,
+            OpenAICompatibleSemanticEvidenceJudge,
+        )
+
+        if not enabled:
+            return DisabledSemanticEvidenceJudge()
+        if self._offline_locked:
+            raise RuntimeError("offline Q&A cannot enable semantic evidence verification")
+        from src.core.providers import provider_for
+        config = provider_for("vision")
+        if not config.configured:
+            raise RuntimeError(
+                "semantic evidence verification requires VLM_BASE_URL, VLM_API_KEY and VLM_MODEL"
+            )
+        spec = (config.base_url, config.model)
+        if self._vqa_semantic_evidence_judge is not None:
+            if self._vqa_semantic_evidence_judge_spec != spec:
+                raise RuntimeError(
+                    "semantic evidence judge is already initialized with a different provider; "
+                    "create a new HCMAIPipeline"
+                )
+            return self._vqa_semantic_evidence_judge
+        self._vqa_semantic_evidence_judge = OpenAICompatibleSemanticEvidenceJudge(
+            config.base_url, config.model, api_key=config.api_key
+        )
+        self._vqa_semantic_evidence_judge_spec = spec
+        return self._vqa_semantic_evidence_judge
 
     def _ensure_trake(self):
         if self._trake is None:
@@ -327,7 +513,10 @@ class HCMAIPipeline:
     def _ensure_trake_visual(self):
         if self._trake_visual is None:
             from trake_pipeline import VisualTrakePipeline
-            self._trake_visual = VisualTrakePipeline()
+            self._trake_visual = VisualTrakePipeline(
+                alignment_policy=self._policy.trake_visual_alignment_policy,
+                candidate_video_limit=self._policy.trake_visual_candidate_video_limit,
+            )
         return self._trake_visual
 
     def _ensure_trake_multimodal(self):
@@ -350,6 +539,7 @@ class HCMAIPipeline:
             self._trake_multimodal = TrakePipeline(
                 mode="multimodal",
                 retrievers=retrievers,
+                alignment_policy=self._policy.trake_multimodal_alignment_policy,
             )
         return self._trake_multimodal
 
@@ -508,7 +698,9 @@ class HCMAIPipeline:
                    local_vlm_path=None, load_in_4bit=None, max_new_tokens=128,
                    use_context=True, question_type=None, required_modalities=None,
                    modality_routing=None, rrf_weights=None, answer_rerank_weights=None,
-        visual_selector_policy=None, offline=None):
+        visual_selector_policy=None, offline=None, external_grounding=None,
+        external_image_grounding=None, hypothesis_generation=None,
+        semantic_evidence_verifier=None):
         """Offline-first ranked Q&A path for the official answer contract."""
         if not isinstance(query, str) or not query.strip():
             raise ValueError("VQA query must be a non-empty string")
@@ -527,6 +719,14 @@ class HCMAIPipeline:
                     max_vlm_candidates=max_vlm_candidates)
         if offline is not None and not isinstance(offline, bool):
             raise ValueError("offline must be a boolean when provided")
+        if external_grounding is not None and not isinstance(external_grounding, bool):
+            raise ValueError("external_grounding must be a boolean when provided")
+        if external_image_grounding is not None and not isinstance(external_image_grounding, bool):
+            raise ValueError("external_image_grounding must be a boolean when provided")
+        if hypothesis_generation is not None and not isinstance(hypothesis_generation, bool):
+            raise ValueError("hypothesis_generation must be a boolean when provided")
+        if semantic_evidence_verifier is not None and not isinstance(semantic_evidence_verifier, bool):
+            raise ValueError("semantic_evidence_verifier must be a boolean when provided")
         if load_in_4bit is not None and not isinstance(load_in_4bit, bool):
             raise ValueError("load_in_4bit must be a boolean when provided")
         execution_offline = (
@@ -535,49 +735,137 @@ class HCMAIPipeline:
         )
         if self._offline_locked and not execution_offline:
             raise RuntimeError("strict HCMAI execution requires offline Q&A")
-        from vqa_pipeline_v3 import infer_question_type, normalize_question_type
+        external_grounding_enabled = (
+            self._policy.vqa_external_grounding
+            if external_grounding is None else external_grounding
+        )
+        external_image_grounding_enabled = (
+            self._policy.vqa_external_image_grounding
+            if external_image_grounding is None else external_image_grounding
+        )
+        hypothesis_generation_enabled = (
+            self._policy.vqa_hypothesis_generation
+            if hypothesis_generation is None else hypothesis_generation
+        )
+        semantic_evidence_verifier_enabled = (
+            self._policy.vqa_semantic_evidence_verifier
+            if semantic_evidence_verifier is None else semantic_evidence_verifier
+        )
+        if (external_grounding_enabled or external_image_grounding_enabled
+                or hypothesis_generation_enabled or semantic_evidence_verifier_enabled) and execution_offline:
+            raise RuntimeError("external grounding requires offline=False and network_mode=online")
+        if hypothesis_generation_enabled and not external_grounding_enabled:
+            raise RuntimeError(
+                "hypothesis_generation requires external_grounding=True; "
+                "hypotheses cannot directly alter local ranking"
+            )
+        grounding_resolver = self._ensure_vqa_grounding_resolver(
+            bool(external_grounding_enabled)
+        )
+        image_grounding_provider = self._ensure_vqa_image_grounding_provider(
+            bool(external_image_grounding_enabled)
+        )
+        hypothesis_generator = self._ensure_vqa_hypothesis_generator(
+            bool(hypothesis_generation_enabled)
+        )
+        semantic_evidence_judge = self._ensure_vqa_semantic_evidence_judge(
+            bool(semantic_evidence_verifier_enabled)
+        )
+        trace.event(
+            "external_grounding",
+            enabled=bool(external_grounding_enabled),
+            provider=("searxng_allowlisted" if external_grounding_enabled else "disabled"),
+        )
+        trace.event(
+            "external_image_grounding",
+            enabled=bool(external_image_grounding_enabled),
+            provider=("searxng_image_to_local_vkis" if external_image_grounding_enabled else "disabled"),
+        )
+        trace.event(
+            "hypothesis_generation",
+            enabled=bool(hypothesis_generation_enabled),
+            provider=("openai_compatible" if hypothesis_generation_enabled else "disabled"),
+        )
+        trace.event(
+            "semantic_evidence_verifier",
+            enabled=bool(semantic_evidence_verifier_enabled),
+            provider=("openai_compatible" if semantic_evidence_verifier_enabled else "disabled"),
+        )
+        from vqa_pipeline_v3 import normalize_question_type
         question_type_source = "explicit" if question_type is not None else "inferred"
         question_type = normalize_question_type(question_type)
         if question_type is None:
-            question_type = infer_question_type(query, question)
+            # Live/plain-text Q&A does not carry a reliable modality label.
+            # Do not convert a wording heuristic into an answer requirement;
+            # run bounded ASR/OCR support lanes under the explicit unknown
+            # policy and let evidence decide later.
+            question_type = "unknown"
         trace.event(
             "question_type",
             value=question_type,
             source=question_type_source,
         )
+        # Normalize JSON-native modality lists before routing.  Query manifests
+        # commonly use ["visual", "asr"], while the internal VQA contract uses
+        # the canonical comma-separated form.  Without this conversion Python's
+        # list repr ("['visual', 'asr']") silently drops the specialist channel.
+        if isinstance(required_modalities, (list, tuple, set, frozenset)):
+            required_modalities = ",".join(
+                str(value).strip() for value in required_modalities if str(value).strip()
+            ) or None
         # Validate routing configuration before constructing/loading the VLM.
         # A typo must fail at the boundary, not after a heavyweight model load.
         from vqa_pipeline_v3 import VQAPipelineV3
-        VQAPipelineV3._parse_modalities(required_modalities)
+        from src.vqa.query_planner import build_vqa_query_plan
+        declared_specialists = VQAPipelineV3._parse_modalities(required_modalities)
         enabled = self._vqa_modality_routing if modality_routing is None else bool(modality_routing)
         modalities = required_modalities
-        if enabled and not modalities and question_type in {"screen_text", "spoken_fact"}:
-            modalities = f"visual,{'ocr' if question_type == 'screen_text' else 'asr'}"
-        # Live query files do not carry the internal benchmark taxonomy.  The
-        # conservative classifier above activates one specialist only for a
-        # strong OCR/ASR cue; ambiguous questions stay visual rather than
-        # requiring unrelated evidence from both text channels.
+        # ``required_modalities`` is an answer contract.  ``support_modalities``
+        # is a retrieval budget.  For unlabelled or text-oriented Q&A, search
+        # both ASR and OCR in parallel without claiming either is mandatory.
+        # Explicit visual-only benchmark labels keep their visual baseline.
         visual_only_types = {
             "visual", "action", "color", "count", "person", "place",
             "temporal_relation",
         }
-        if not modalities and enabled and question_type not in visual_only_types:
-            raise RuntimeError(f"no routing policy for inferred question type {question_type!r}")
-        requested_specialists = [
-            part.strip().lower() for part in str(modalities or "").replace(";", ",").split(",")
-            if part.strip().lower() in {"asr", "ocr"}
-        ]
-        global_router = self._ensure_vqa_modality_router(requested_specialists) if enabled and requested_specialists else None
-        active_modalities = ["visual"] + (requested_specialists if global_router is not None else [])
+        support_modalities = None
+        if enabled:
+            if question_type in {"spoken_fact", "screen_text"}:
+                # The annotation decides what must verify an answer (ASR for
+                # spoken facts, OCR for visible text). It must not suppress
+                # the other local text lane during *retrieval*: programme
+                # names, places and recipe cards frequently cross the two.
+                # This is metadata-driven parallel retrieval, never a lexical
+                # fallback or an additional answer-evidence requirement.
+                support_modalities = "visual,asr,ocr"
+            elif declared_specialists:
+                support_modalities = modalities
+            elif question_type not in visual_only_types:
+                support_modalities = "visual,asr,ocr"
+        declared_specialists = VQAPipelineV3._parse_modalities(modalities)
+        support_plan = build_vqa_query_plan(
+            query, question, question_type=question_type,
+            modalities=VQAPipelineV3._parse_modalities(support_modalities),
+        )
+        requested_specialists = list(support_plan.support_modalities)
+        global_router = (
+            self._ensure_vqa_modality_router(requested_specialists)
+            if enabled and requested_specialists else None
+        )
+        active_modalities = ["visual"] + (
+            requested_specialists if global_router is not None else []
+        )
         decision = decide_specialist_flow(
             trace.context,
             owner="qna",
-            required_modalities=requested_specialists,
+            required_modalities=declared_specialists,
             available_modalities=active_modalities,
-            specialist_hit=global_router is not None and bool(requested_specialists),
+            specialist_hit=global_router is not None and bool(declared_specialists),
         )
-        trace.event("routing", requested=modalities, enabled=enabled,
-                    router_ready=global_router is not None)
+        trace.event("routing", required=modalities, support=support_modalities, enabled=enabled,
+                    router_ready=global_router is not None,
+                    declared_specialists=declared_specialists,
+                    support_specialists=requested_specialists)
         if decision.state == "failed":
             self._finish_trace(trace, decision)
             raise RuntimeError(decision.error or "Q&A modality route is unavailable")
@@ -594,6 +882,7 @@ class HCMAIPipeline:
                 use_context=use_context, offline=execution_offline,
                 question_type=question_type,
                 required_modalities=modalities,
+                support_modalities=support_modalities,
                 global_modality_router=global_router,
                 rrf_weights=rrf_weights,
                 answer_rerank_weights=answer_rerank_weights,
@@ -601,13 +890,37 @@ class HCMAIPipeline:
                     self._policy.vqa_visual_selector_policy
                     if visual_selector_policy is None else visual_selector_policy
                 ),
+                grounding_resolver=grounding_resolver,
+                image_grounding_provider=image_grounding_provider,
+                hypothesis_generator=hypothesis_generator,
+                semantic_evidence_judge=semantic_evidence_judge,
             )
             route_state = out.get("route_state")
-            if requested_specialists and route_state is not None and route_state != "specialist_success":
+            query_plan = out.get("query_plan", {})
+            trace.event(
+                "external_grounding_result",
+                evidence_count=len(query_plan.get("external_evidence", ())),
+                status=query_plan.get("external_grounding_status", "not_used"),
+            )
+            image_grounding = out.get("image_grounding", {})
+            trace.event(
+                "external_image_grounding_result",
+                status=image_grounding.get("status", "disabled"),
+                candidate_count=int(image_grounding.get("candidate_count", 0)),
+            )
+            trace.event(
+                "hypothesis_generation_result",
+                status=(out.get("hypothesis_plan") or {}).get("status", "used"),
+            )
+            trace.event(
+                "semantic_evidence_verifier_result",
+                **(out.get("semantic_evidence_verifier") or {"enabled": False}),
+            )
+            if declared_specialists and route_state is not None and route_state != "specialist_success":
                 decision = decide_specialist_flow(
                     trace.context,
                     owner="qna",
-                    required_modalities=requested_specialists,
+                    required_modalities=declared_specialists,
                     available_modalities=active_modalities,
                     specialist_hit=False,
                 )
@@ -628,7 +941,7 @@ class HCMAIPipeline:
 
         Visual DANTE is the default production path because the fixed
         independent benchmark is materially stronger than ASR DANTE. ASR is
-        retained as an explicit fallback/diagnostic mode.
+        an explicit alternate diagnostic mode, never an automatic fallback.
         """
         if isinstance(events, (str, bytes)) or not events:
             raise ValueError("TRAKE events must be a non-empty sequence")

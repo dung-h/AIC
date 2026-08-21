@@ -5,7 +5,8 @@ The integration boundary is intentionally small and pipeline-independent::
     plan = build_routing_plan(question_type, config)
     rows = route_video_candidates(channel_candidates, plan)
 
-``channel_candidates`` maps ``visual``, ``asr`` and ``ocr`` to ranked
+``channel_candidates`` maps ``visual``, ``asr``, ``ocr`` and optional
+precision event lanes (currently ``poetry``) to ranked
 iterables.  Weights and rescue thresholds are configuration/dev-sweep inputs;
 this module never reads holdout metrics or silently tunes them.
 """
@@ -20,7 +21,7 @@ from typing import Any, Iterable, Mapping
 from .video_rrf import weighted_video_rrf
 
 
-CHANNELS = ("visual", "asr", "ocr")
+CHANNELS = ("visual", "asr", "ocr", "poetry")
 QUESTION_TYPES = ("visual", "spoken_fact", "screen_text", "temporal_relation", "unknown")
 VISUAL_QUESTION_TYPES = frozenset(
     {"visual", "color", "action", "count", "person", "place"}
@@ -59,7 +60,15 @@ def _finite_number(value: Any, field_name: str) -> float:
 
 @dataclass(frozen=True)
 class RescueGate:
-    """Rank/evidence gate for specialist-only video rescue."""
+    """Rank/evidence gate for specialist-only video rescue.
+
+    ``strong_rank`` remains the conservative default rescue path. The
+    evidence-aware path is intentionally narrower: it can admit a lower-ranked
+    specialist hit only when the candidate contains actual local text *and*
+    carries a strong lexical or quoted-fact provenance record. This keeps a
+    generic OCR/ASR utterance from becoming a video-level vote merely because
+    it happens to have a non-empty ``text`` field.
+    """
 
     enabled: bool = True
     strong_rank: int = 5
@@ -71,10 +80,22 @@ class RescueGate:
     evidence_keys: tuple[str, ...] = (
         "evidence", "text", "asr_text", "ocr_text", "transcript",
     )
+    evidence_aware_rescue_enabled: bool = True
+    evidence_aware_max_rank: int = 20
+    provenance_max_rank: int = 3
+    provenance_min_score: float = 0.8
+    provenance_modes: tuple[str, ...] = (
+        "bm25_coverage", "lexical_exact", "exact", "exact_match",
+        "quote", "quoted_fact",
+    )
 
     def __post_init__(self) -> None:
         if int(self.strong_rank) < 1 or int(self.support_rank) < 1:
             raise RoutingPolicyError("rescue ranks must be positive")
+        if int(self.evidence_aware_max_rank) < 1:
+            raise RoutingPolicyError("evidence_aware_max_rank must be positive")
+        if int(self.provenance_max_rank) < 1:
+            raise RoutingPolicyError("provenance_max_rank must be positive")
         if int(self.min_specialist_channels) < 1:
             raise RoutingPolicyError("min_specialist_channels must be >= 1")
         keys = tuple(str(key).strip() for key in self.evidence_keys if str(key).strip())
@@ -83,7 +104,25 @@ class RescueGate:
         object.__setattr__(self, "strong_rank", int(self.strong_rank))
         object.__setattr__(self, "support_rank", int(self.support_rank))
         object.__setattr__(self, "min_specialist_channels", int(self.min_specialist_channels))
+        object.__setattr__(self, "evidence_aware_max_rank", int(self.evidence_aware_max_rank))
+        object.__setattr__(self, "provenance_max_rank", int(self.provenance_max_rank))
+        object.__setattr__(
+            self, "provenance_min_score",
+            _finite_number(self.provenance_min_score, "provenance_min_score"),
+        )
         object.__setattr__(self, "evidence_keys", keys)
+        provenance_modes = tuple(
+            dict.fromkeys(
+                str(mode).strip().lower()
+                for mode in self.provenance_modes
+                if str(mode).strip()
+            )
+        )
+        if self.evidence_aware_rescue_enabled and not provenance_modes:
+            raise RoutingPolicyError(
+                "provenance_modes cannot be empty when evidence-aware rescue is enabled"
+            )
+        object.__setattr__(self, "provenance_modes", provenance_modes)
         object.__setattr__(
             self,
             "min_scores",
@@ -93,13 +132,20 @@ class RescueGate:
 
     @classmethod
     def disabled(cls) -> "RescueGate":
-        return cls(enabled=False, require_evidence=False, evidence_keys=())
+        return cls(
+            enabled=False,
+            require_evidence=False,
+            evidence_keys=(),
+            evidence_aware_rescue_enabled=False,
+        )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RescueGate":
         allowed = {
             "enabled", "strong_rank", "support_rank", "min_specialist_channels",
             "allow_single_strong_rescue", "require_evidence", "min_scores", "evidence_keys",
+            "evidence_aware_rescue_enabled", "evidence_aware_max_rank",
+            "provenance_max_rank", "provenance_min_score", "provenance_modes",
         }
         unknown = set(value) - allowed
         if unknown:
@@ -162,8 +208,15 @@ class RoutingConfig:
             enabled=enabled,
             weights_by_type={
                 "visual": {"visual": 1.0},
-                "spoken_fact": {"visual": 0.75, "asr": 1.0},
-                "screen_text": {"visual": 0.75, "ocr": 1.0},
+                # Both text lanes remain retrieval support. The primary
+                # modality below is still the only required evidence for
+                # answer acceptance; RRF never requires both specialists.
+                # ``poetry`` is an optional ASR-event lane: it is only
+                # materialized for an explicit verse request and every row is
+                # locally joined to a same-video entity context. It is not an
+                # answer modality and cannot exist for ordinary spoken facts.
+                "spoken_fact": {"visual": 0.75, "asr": 1.0, "ocr": 0.5, "poetry": 1.0},
+                "screen_text": {"visual": 0.75, "asr": 0.5, "ocr": 1.0},
                 "temporal_relation": {"visual": 1.0, "asr": 0.5, "ocr": 0.5},
                 "unknown": {"visual": 1.0, "asr": 0.5, "ocr": 0.5},
             },
@@ -300,7 +353,10 @@ def build_routing_plan(question_type: str | None, config: RoutingConfig) -> Quer
         specialist_channels=specialists,
         weights=weights,
         rescue_gate=gate,
-        required_channels=(primary,),
+        # Visual retrieval is the invariant anchor. The primary text lane is
+        # required for its own evidence contract; the other specialist lane is
+        # parallel support only and must never become an answer precondition.
+        required_channels=tuple(dict.fromkeys(("visual", primary))),
         rrf_k=config.rrf_k,
         retrieval_top_k=config.retrieval_top_k,
         output_top_k=config.output_top_k,
@@ -353,6 +409,13 @@ def route_video_candidates(
         require_specialist_evidence=gate.require_evidence and gate.enabled,
         evidence_keys=gate.evidence_keys,
         specialist_rescue_enabled=gate.enabled,
+        evidence_aware_rescue_enabled=(
+            gate.enabled and gate.evidence_aware_rescue_enabled
+        ),
+        evidence_aware_max_rank=gate.evidence_aware_max_rank,
+        provenance_max_rank=gate.provenance_max_rank,
+        provenance_min_score=gate.provenance_min_score,
+        provenance_modes=gate.provenance_modes,
     )
 
 

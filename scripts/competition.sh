@@ -10,8 +10,6 @@ hcmai_load_dotenv "${HCMAI_DOTENV:-${repo_root}/.env}"
 # new Linux server even when its own .venv was healthy.
 if [[ -n "${HCMAI_PYTHON:-}" ]]; then
   python_bin="${HCMAI_PYTHON}"
-elif [[ -x "/home/user1/hcmai-venv/bin/python" ]]; then
-  python_bin="/home/user1/hcmai-venv/bin/python"
 elif [[ -x "${repo_root}/.venv/bin/python" ]]; then
   python_bin="${repo_root}/.venv/bin/python"
 else
@@ -36,13 +34,11 @@ export PYTHONPATH="$repo_root"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
-# Keep the fast native-Linux model copy when it exists, but allow every
-# deployment to override it explicitly.  The fallback under the project is
-# what makes a self-contained server bundle work without /home/user1.
+# A deployment owns its model placement through HCMAI_LOCAL_VLM_PATH.  The
+# repository-local fallback makes a self-contained source-plus-assets bundle
+# usable, but no workstation-specific home directory is ever consulted.
 if [[ -z "${HCMAI_LOCAL_VLM_PATH:-}" ]]; then
-  if [[ -d "/home/user1/runtime_models/Qwen2.5-VL-7B-Instruct" ]]; then
-    export HCMAI_LOCAL_VLM_PATH="/home/user1/runtime_models/Qwen2.5-VL-7B-Instruct"
-  elif [[ -d "${repo_root}/models/Qwen2.5-VL-7B-Instruct" ]]; then
+  if [[ -d "${repo_root}/models/Qwen2.5-VL-7B-Instruct" ]]; then
     export HCMAI_LOCAL_VLM_PATH="${repo_root}/models/Qwen2.5-VL-7B-Instruct"
   fi
 fi

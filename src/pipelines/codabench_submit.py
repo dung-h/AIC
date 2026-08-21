@@ -30,7 +30,9 @@ Input CSV expected columns:
 Official output: answer.zip chứa submission/query-*-kis|qa|trake.csv
 """
 import csv
+import hashlib
 import io
+import math
 import os, sys, json, time
 import re
 import tempfile
@@ -56,6 +58,7 @@ AIC26_OFFICIAL_FORMAT = "aic2026_official"
 AIC26_MAX_ROWS = 100
 AIC26_MAX_ANSWER_CHARS = 100
 _AIC26_QUERY_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
+_AIC26_MEMBER_TASK = re.compile(r"^submission/query-[A-Za-z0-9._-]+-(kis|qa|trake)\.csv$", re.IGNORECASE)
 COMPATIBILITY_CLI_REDIRECT = (
     "codabench_submit.py is a compatibility-only single-task adapter; "
     "use ./scripts/competition.sh run --queries QUERY.json --output ANSWER.zip "
@@ -126,6 +129,69 @@ def _aic26_canonical_contains(canonical_frames, video_id, frame_idx):
         raise TypeError("canonical_frames must support membership or contains()") from exc
 
 
+def load_production_canonical_registry(path=None):
+    """Load the one immutable canonical authority for production packaging.
+
+    Retrieval indexes are optimized replicas and may be stale.  They must
+    never validate their own output.  The global keyframe registry is instead
+    loaded once at the submission boundary and its content hash is returned
+    for the audit sidecar.
+    """
+    registry_path = (
+        Path(path) if path is not None
+        else Path(__file__).resolve().parents[2] / "data" / "index" / "global_keyframes.parquet"
+    ).resolve()
+    if not registry_path.is_file():
+        raise RuntimeError(f"production canonical registry is unavailable: {registry_path}")
+    try:
+        frame_map = pd.read_parquet(
+            registry_path, columns=["video_id", "kf_n", "frame_idx", "pts_time"]
+        )
+    except Exception as exc:
+        raise RuntimeError(f"cannot load production canonical registry: {registry_path}") from exc
+    if frame_map.empty:
+        raise RuntimeError("production canonical registry is empty")
+    if frame_map[["video_id", "kf_n", "frame_idx", "pts_time"]].isna().any().any():
+        raise RuntimeError("production canonical registry contains null identities")
+    pairs = set()
+    canonical_keyframes: set[tuple[str, int]] = set()
+    for raw_video_id, raw_kf_n, raw_frame_idx, raw_pts_time in frame_map[
+        ["video_id", "kf_n", "frame_idx", "pts_time"]
+    ].itertuples(index=False):
+        video_id = str(raw_video_id).strip()
+        if not video_id:
+            raise RuntimeError("production canonical registry contains an empty video_id")
+        if isinstance(raw_kf_n, bool) or isinstance(raw_frame_idx, bool):
+            raise RuntimeError("production canonical registry contains a boolean frame_idx")
+        try:
+            kf_n = int(raw_kf_n)
+            frame_idx = int(raw_frame_idx)
+            pts_time = float(raw_pts_time)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("production canonical registry contains an invalid frame_idx") from exc
+        if kf_n < 0 or frame_idx < 0 or not math.isfinite(pts_time) or pts_time < 0:
+            raise RuntimeError("production canonical registry contains a negative frame_idx")
+        keyframe_identity = (video_id, kf_n)
+        if keyframe_identity in canonical_keyframes:
+            raise RuntimeError(
+                f"production canonical registry duplicates keyframe identity: {video_id}/{kf_n}"
+            )
+        canonical_keyframes.add(keyframe_identity)
+        # Different keyframes can legitimately round/map to the same output
+        # frame index. The submission contract is `(video_id, frame_idx)`, so
+        # membership intentionally uses the unique pair rather than treating
+        # that representation detail as a corrupt registry.
+        pairs.add((video_id, frame_idx))
+    digest = hashlib.sha256(registry_path.read_bytes()).hexdigest()
+    return pairs, {
+        "path": str(registry_path),
+        "sha256": digest,
+        "row_count": len(frame_map),
+        "unique_output_pairs": len(pairs),
+        "schema": "global_keyframes.parquet/video_id+frame_idx",
+    }
+
+
 def format_aic26_query_csv(task, query_id, answers, *, canonical_frames, event_count=None):
     """Validate and serialize one official AIC26 query CSV as UTF-8 bytes."""
     task = _aic26_task(task)
@@ -142,7 +208,57 @@ def format_aic26_query_csv(task, query_id, answers, *, canonical_frames, event_c
     ):
         raise ValueError(f"query {query_id}: TRAKE event_count must be a positive integer")
 
+    # The official ZIP writer must enforce exactly the same answer quality
+    # invariants as the ranked adapters.  A previous implementation only
+    # checked empty strings here, which meant a preflight could reject
+    # ``unknown`` or duplicate rows while the production writer still emitted
+    # them.  Normalize before row formatting, but preserve caller rank order.
+    if task == "qa":
+        for rank, raw in enumerate(answers, 1):
+            if not isinstance(raw, Mapping):
+                raise TypeError(f"query {query_id} rank {rank}: answer must be an object")
+            _aic26_frame_idx(
+                raw.get("frame_idx", raw.get("frame_id")), query_id=query_id, rank=rank,
+            )
+            raw_answer = raw.get("answer")
+            if raw_answer is None:
+                raise ValueError(f"query {query_id} rank {rank}: QA answer must not be null")
+            text_answer = str(raw_answer).strip()
+            if (
+                not text_answer
+                or "\x00" in text_answer
+                or "\n" in text_answer
+                or "\r" in text_answer
+            ):
+                raise ValueError(f"query {query_id} rank {rank}: QA answer must not be empty")
+        try:
+            from src.submission.validators import validate_qna_answers
+            answers = [record.external() for record in validate_qna_answers(
+                answers, canonical_frames=canonical_frames,
+            )]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"query {query_id}: invalid Q&A ranked answer: {exc}") from exc
+    elif task == "trake":
+        for rank, raw in enumerate(answers, 1):
+            if not isinstance(raw, Mapping):
+                raise TypeError(f"query {query_id} rank {rank}: answer must be an object")
+            frame_values = raw.get("frame_ids")
+            if not isinstance(frame_values, Sequence) or isinstance(frame_values, (str, bytes)):
+                raise ValueError(f"query {query_id} rank {rank}: frame_ids must be a sequence")
+            for value in frame_values:
+                _aic26_frame_idx(value, query_id=query_id, rank=rank)
+        try:
+            from src.submission.validators import validate_trake_answers
+            answers = [record.external() for record in validate_trake_answers(
+                answers,
+                event_count=int(event_count),
+                canonical_frames=canonical_frames,
+            )]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"query {query_id}: invalid TRAKE ranked answer: {exc}") from exc
+
     csv_rows = []
+    seen_kis: set[tuple[str, int]] = set()
     for rank, answer in enumerate(answers, 1):
         if not isinstance(answer, Mapping):
             raise TypeError(f"query {query_id} rank {rank}: answer must be an object")
@@ -181,6 +297,12 @@ def format_aic26_query_csv(task, query_id, answers, *, canonical_frames, event_c
                 f"query {query_id} rank {rank}: non-canonical frame {video_id}/{frame_idx}"
             )
         if task == "kis":
+            identity = (video_id.casefold(), frame_idx)
+            if identity in seen_kis:
+                raise ValueError(
+                    f"query {query_id} rank {rank}: duplicate KIS ranked answer"
+                )
+            seen_kis.add(identity)
             csv_rows.append([video_id, frame_idx])
             continue
 
@@ -342,6 +464,67 @@ def write_aic26_mixed_submission_zip(
         "task_counts": task_counts,
         "members": [value[0] for value in members.values()],
     }
+
+
+def validate_aic26_submission_zip(path, *, canonical_frames):
+    """Re-parse an official ZIP through the production formatter.
+
+    This is deliberately a transport-boundary check, not an alternative
+    serializer: every member is reconstructed and must byte-match the
+    canonical formatter.  It catches corruption or a future writer drift
+    before a package is handed to the competition portal.
+    """
+    bundle_path = Path(path)
+    if not bundle_path.is_file() or bundle_path.suffix.casefold() != ".zip":
+        raise ValueError("official submission ZIP is unavailable")
+    member_count = row_count = 0
+    with zipfile.ZipFile(bundle_path) as bundle:
+        members = [member for member in bundle.infolist() if not member.is_dir()]
+        if not members:
+            raise ValueError("official submission ZIP has no query CSV members")
+        for member in members:
+            match = _AIC26_MEMBER_TASK.fullmatch(member.filename)
+            if match is None:
+                raise ValueError(f"invalid official ZIP member: {member.filename!r}")
+            task = match.group(1).casefold()
+            raw = bundle.read(member)
+            try:
+                rows = list(csv.reader(io.StringIO(raw.decode("utf-8"))))
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"official ZIP member is not UTF-8: {member.filename!r}") from exc
+            if not rows:
+                raise ValueError(f"official ZIP member is empty: {member.filename!r}")
+            if task == "kis":
+                if any(len(row) != 2 for row in rows):
+                    raise ValueError(f"invalid KIS row width: {member.filename!r}")
+                answers = [{"video_id": row[0], "frame_idx": row[1]} for row in rows]
+                event_count = None
+            elif task == "qa":
+                if any(len(row) != 3 for row in rows):
+                    raise ValueError(f"invalid Q&A row width: {member.filename!r}")
+                answers = [
+                    {"video_id": row[0], "frame_id": row[1], "answer": row[2]}
+                    for row in rows
+                ]
+                event_count = None
+            else:
+                widths = {len(row) for row in rows}
+                if len(widths) != 1 or next(iter(widths)) < 3:
+                    raise ValueError(f"invalid TRAKE row width: {member.filename!r}")
+                event_count = next(iter(widths)) - 1
+                answers = [
+                    {"video_id": row[0], "frame_ids": row[1:]}
+                    for row in rows
+                ]
+            rendered = format_aic26_query_csv(
+                task, member.filename, answers,
+                canonical_frames=canonical_frames, event_count=event_count,
+            )
+            if rendered != raw:
+                raise ValueError(f"official ZIP member is not canonical: {member.filename!r}")
+            member_count += 1
+            row_count += len(rows)
+    return {"member_count": member_count, "row_count": row_count, "canonical_validated": True}
 
 
 def format_submission_rows(rows, fmt="codabench_2025"):

@@ -43,6 +43,7 @@ from src.reranking.asr_index import normalize_transcript
 
 SCHEMA_VERSION = "hcmai.asr_global_v2"
 PROTOCOL_VERSION = "ASR global v2"
+CHUNKING_POLICY_VERSION = "deepgram_word_window_v1"
 SUPPORTED_PACKS = tuple([f"K{number:02d}" for number in range(1, 21)] + [f"L{number:02d}" for number in range(21, 31)])
 VIDEO_RE = re.compile(r"^(?P<pack>[KL]\d{2})_V(?P<number>\d{3})$", re.IGNORECASE)
 ZIP_RE = re.compile(r"^Videos_(?P<pack>[KL]\d{2})(?:_[A-Za-z0-9]+)?\.zip$", re.IGNORECASE)
@@ -102,13 +103,14 @@ class RunnerConfig:
     language: str = "vi"
     env_path: Path | None = None
     resume: bool = False
+    raw_only: bool = False
 
     def validate(self) -> None:
         if self.batch_size < 1:
             raise ASRGlobalV2Error("batch_size must be positive")
         if self.max_videos is not None and self.max_videos < 1:
             raise ASRGlobalV2Error("max_videos must be positive when provided")
-        if self.execute and not (self.allow_network and self.confirm_api):
+        if self.execute and not self.raw_only and not (self.allow_network and self.confirm_api):
             raise ASRNetworkApprovalError(
                 "real ASR execution requires --execute --allow-network --confirm-api"
             )
@@ -303,22 +305,103 @@ def _chunk_from_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
     return {"text": text, "start": start, "end": end}
 
 
+def _word_timestamp_chunks(
+    words: Sequence[Any],
+    *,
+    target_seconds: float = 8.0,
+    min_seconds: float = 6.0,
+    overlap_seconds: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Build short, overlapping text windows from Deepgram word timestamps.
+
+    Paragraphs returned by Deepgram are useful for display but can span several
+    minutes.  Mapping a paragraph midpoint to one canonical keyframe destroys
+    temporal retrieval precision.  Word timestamps are already present in the
+    raw provider response, so use them whenever they are valid and retain the
+    paragraph/utterance paths only as a compatibility fallback.
+
+    The window is bounded at ``target_seconds`` and advances with a small
+    overlap.  This makes a spoken fact near either boundary retrievable without
+    duplicating the full transcript in every chunk.
+    """
+    if target_seconds <= 0 or min_seconds < 0 or min_seconds > target_seconds:
+        raise ASRGlobalV2Error("invalid word timestamp chunking configuration")
+    if overlap_seconds < 0 or overlap_seconds >= target_seconds:
+        raise ASRGlobalV2Error("word timestamp overlap must be in [0, target_seconds)")
+
+    tokens: list[dict[str, Any]] = []
+    for item in words:
+        if not isinstance(item, Mapping):
+            continue
+        text = _normalise_text(item.get("punctuated_word") or item.get("word") or "")
+        start = _number(item.get("start"))
+        end = _number(item.get("end"))
+        if not text or start is None or end is None or start < 0 or end < start:
+            continue
+        tokens.append({"text": text, "start": start, "end": end})
+    tokens.sort(key=lambda item: (item["start"], item["end"], item["text"]))
+    if not tokens:
+        return []
+
+    chunks: list[dict[str, Any]] = []
+    first = 0
+    while first < len(tokens):
+        start = tokens[first]["start"]
+        last = first
+        while last + 1 < len(tokens):
+            candidate = last + 1
+            duration = tokens[candidate]["end"] - start
+            gap = tokens[candidate]["start"] - tokens[last]["end"]
+            # Do not bridge programme cuts/silence or let a single sparse
+            # timestamp expand the anchor window beyond the declared budget.
+            if duration > target_seconds or gap > overlap_seconds:
+                break
+            last = candidate
+            # Prefer a natural sentence boundary once the chunk is long enough;
+            # otherwise cut at the bounded target duration.
+            if duration >= min_seconds and tokens[candidate]["text"].rstrip().endswith((".", "!", "?", "…")):
+                break
+            if duration >= target_seconds:
+                break
+
+        selected = tokens[first : last + 1]
+        text = _normalise_text(" ".join(token["text"] for token in selected))
+        if text:
+            chunks.append({"text": text, "start": start, "end": selected[-1]["end"]})
+        if last >= len(tokens) - 1:
+            break
+
+        next_start_time = selected[-1]["end"] - overlap_seconds
+        next_first = first + 1
+        while next_first <= last and tokens[next_first]["start"] < next_start_time:
+            next_first += 1
+        # A very short final window may otherwise make no progress.
+        first = max(first + 1, next_first)
+    return chunks
+
+
 def iter_timestamped_chunks(payload: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
-    """Extract deterministic, deduplicated Deepgram utterance chunks."""
+    """Extract deterministic, timestamped Deepgram chunks at retrieval resolution."""
     results = payload.get("results") if isinstance(payload, Mapping) else None
     results = results if isinstance(results, Mapping) else {}
     candidates: list[dict[str, Any]] = []
-    utterances = results.get("utterances") or []
-    for item in utterances:
-        if isinstance(item, Mapping):
-            chunk = _chunk_from_item(item)
-            if chunk is not None:
-                candidates.append(chunk)
+    channels = results.get("channels") or []
+    channel = channels[0] if channels and isinstance(channels[0], Mapping) else {}
+    alternatives = channel.get("alternatives") or []
+    alternative = alternatives[0] if alternatives and isinstance(alternatives[0], Mapping) else {}
+
+    # Prefer the most granular trustworthy representation.  Deepgram's
+    # paragraphs can be hundreds of seconds long even though ``words`` has
+    # exact timings, as observed in the L27 spoken-fact regression case.
+    candidates.extend(_word_timestamp_chunks(alternative.get("words") or []))
     if not candidates:
-        channels = results.get("channels") or []
-        channel = channels[0] if channels and isinstance(channels[0], Mapping) else {}
-        alternatives = channel.get("alternatives") or []
-        alternative = alternatives[0] if alternatives and isinstance(alternatives[0], Mapping) else {}
+        utterances = results.get("utterances") or []
+        for item in utterances:
+            if isinstance(item, Mapping):
+                chunk = _chunk_from_item(item)
+                if chunk is not None:
+                    candidates.append(chunk)
+    if not candidates:
         paragraphs = alternative.get("paragraphs") or {}
         for paragraph in paragraphs.get("paragraphs") or []:
             if not isinstance(paragraph, Mapping):
@@ -590,6 +673,44 @@ class ASRGlobalV2Runner:
 
     def preflight(self, packs: Sequence[str]) -> dict[str, Any]:
         requested = tuple(_normalise_pack(pack) for pack in packs)
+        if self.config.raw_only:
+            pack_reports: dict[str, Any] = {}
+            for pack in requested:
+                canonical_videos = sorted(
+                    video for video in self.canonical if video.startswith(pack + "_")
+                )
+                raw_files = {
+                    video: self.config.raw_dir / pack.lower() / f"{video}.json"
+                    for video in canonical_videos
+                }
+                missing_raw = [video for video, path in raw_files.items() if not path.is_file()]
+                if missing_raw:
+                    raise ASRGlobalV2Error(
+                        f"raw-only ASR materialization missing raw JSON for {pack}: "
+                        f"{missing_raw[:5]}"
+                    )
+                pack_reports[pack] = {
+                    "archive_paths": [],
+                    "archive_video_count": 0,
+                    "canonical_video_count": len(canonical_videos),
+                    "video_ids": canonical_videos,
+                    "raw_video_count": len(raw_files),
+                    "status": "ready",
+                }
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "protocol": PROTOCOL_VERSION,
+                "selected_packs": list(requested),
+                "canonical_path": str(self.config.canonical_path),
+                "canonical_sha256": _sha256(self.config.canonical_path),
+                "archive_root": None,
+                "raw_dir": str(self.config.raw_dir),
+                "raw_only": True,
+                "packs": pack_reports,
+                "deepgram_api_key_configured": bool(load_deepgram_key(self.config.env_path)),
+                "network_approved": False,
+                "dry_run": not self.config.execute,
+            }
         self._archives = discover_pack_archives(self.config.archive_root, requested)
         pack_reports: dict[str, Any] = {}
         for pack, archive in self._archives.items():
@@ -621,7 +742,10 @@ class ASRGlobalV2Runner:
             "packs": pack_reports,
             "deepgram_api_key_configured": bool(load_deepgram_key(self.config.env_path)),
             "network_approved": bool(
-                self.config.execute and self.config.allow_network and self.config.confirm_api
+                not self.config.raw_only
+                and self.config.execute
+                and self.config.allow_network
+                and self.config.confirm_api
             ),
             "dry_run": not self.config.execute,
         }
@@ -672,7 +796,10 @@ class ASRGlobalV2Runner:
                 "language": self.config.language,
                 "api_key_configured": bool(load_deepgram_key(self.config.env_path)),
                 "network_approved": bool(
-                    self.config.execute and self.config.allow_network and self.config.confirm_api
+                    not self.config.raw_only
+                    and self.config.execute
+                    and self.config.allow_network
+                    and self.config.confirm_api
                 ),
                 "network_calls": 0,
             },
@@ -681,6 +808,12 @@ class ASRGlobalV2Runner:
                 "model": self.config.model,
                 "materialized": False,
                 "dimension": None,
+            },
+            "chunking": {
+                "policy": CHUNKING_POLICY_VERSION,
+                "source_priority": ["word_timestamps", "utterances", "paragraph_sentences"],
+                "target_seconds": 8.0,
+                "overlap_seconds": 2.0,
             },
             "packs": {},
             "ready_for_global": False,
@@ -728,6 +861,10 @@ class ASRGlobalV2Runner:
                 # video instead of poisoning the entire resumable pack.
                 _quarantine_invalid_raw(raw_path)
         if payload is None:
+            if self.config.raw_only:
+                raise ASRGlobalV2Error(
+                    f"raw-only ASR materialization cannot recover missing/invalid raw response: {raw_path}"
+                )
             _extract_video(archive, member, video_id, media_path)
             wav_path.parent.mkdir(parents=True, exist_ok=True)
             if self.ffmpeg_runner is None:
@@ -758,13 +895,21 @@ class ASRGlobalV2Runner:
         return mapped, str(raw_path)
 
     def _run_pack(self, pack: str, preflight: Mapping[str, Any]) -> dict[str, Any]:
-        assert self._archives is not None
-        archive = self._archives[pack]
-        members = self._archive_members[pack]
+        if self.config.raw_only:
+            archive = None
+            members = {
+                video: ""
+                for video in self.canonical
+                if video.startswith(pack + "_")
+            }
+        else:
+            assert self._archives is not None
+            archive = self._archives[pack]
+            members = self._archive_members[pack]
         selected = list(members)
         if self.config.max_videos is not None:
             selected = selected[: self.config.max_videos]
-        transcriber = self._get_transcriber()
+        transcriber = None if self.config.raw_only else self._get_transcriber()
         rows: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
         raw_files: dict[str, str] = {}
@@ -781,7 +926,7 @@ class ASRGlobalV2Runner:
                 break
         pack_report: dict[str, Any] = {
             "pack": pack,
-            "archive_paths": [str(path) for path in archive.paths],
+            "archive_paths": [] if archive is None else [str(path) for path in archive.paths],
             "expected_videos": len(selected),
             "completed_videos": len(raw_files),
             "failed_videos": sorted(errors),
@@ -826,7 +971,11 @@ class ASRGlobalV2Runner:
             raise ASRGlobalV2Error("at least one pack is required")
         if not self.config.execute:
             return self._dry_run(selected)
-        if not load_deepgram_key(self.config.env_path) and self.transcriber is None:
+        if (
+            not self.config.raw_only
+            and not load_deepgram_key(self.config.env_path)
+            and self.transcriber is None
+        ):
             raise ASRNetworkApprovalError("DEEPGRAM_API_KEY is not configured")
         preflight = self.preflight(selected)
         manifest_path = self.config.output_dir / "asr_global_v2_manifest.json"
@@ -920,6 +1069,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-network", action="store_true", help="explicitly allow Deepgram network calls")
     parser.add_argument("--confirm-api", action="store_true", help="confirm Deepgram usage/cost")
     parser.add_argument("--resume", action="store_true", help="resume the exact existing selected-pack manifest")
+    parser.add_argument(
+        "--raw-only", action="store_true",
+        help="rebuild chunks/embeddings from existing raw Deepgram JSON only; never extract media or call Deepgram",
+    )
     parser.add_argument("--env", dest="env_path", type=Path, default=None)
     parser.add_argument("--api-model", default="nova-3")
     parser.add_argument("--language", default="vi")
@@ -950,6 +1103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             language=args.language,
             env_path=args.env_path,
             resume=args.resume,
+            raw_only=args.raw_only,
         )
         report = ASRGlobalV2Runner(config).run(_parse_packs(args.packs))
         print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2, sort_keys=True))

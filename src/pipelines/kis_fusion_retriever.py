@@ -23,7 +23,10 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
 from paths import INDEX_DIR  # noqa: E402
 from src.core.providers import provider_for  # noqa: E402
-from src.utils.open_clip_local import get_tokenizer as get_local_tokenizer  # noqa: E402
+from src.utils.open_clip_local import (  # noqa: E402
+    create_model_and_transforms_local,
+    get_tokenizer as get_local_tokenizer,
+)
 
 
 IDX = str(INDEX_DIR)
@@ -103,14 +106,18 @@ class KISFusionRetriever:
             self.F_so = None
             self.km_so = None
 
-        self.m_vitl, _, _ = open_clip.create_model_and_transforms("ViT-L-16-SigLIP2-256", pretrained="webli")
+        self.m_vitl, _, _ = create_model_and_transforms_local(
+            open_clip, "ViT-L-16-SigLIP2-256"
+        )
         self.m_vitl = self.m_vitl.to(self.dev).eval()
         if self.dev == "cuda":
             self.m_vitl = self.m_vitl.half()
         self.tk_vitl = get_local_tokenizer(open_clip, "ViT-L-16-SigLIP2-256")
 
         if self.has_so400m:
-            self.m_so, _, _ = open_clip.create_model_and_transforms("ViT-SO400M-16-SigLIP2-384", pretrained="webli")
+            self.m_so, _, _ = create_model_and_transforms_local(
+                open_clip, "ViT-SO400M-16-SigLIP2-384"
+            )
             self.m_so = self.m_so.to(self.dev).eval()
             if self.dev == "cuda":
                 self.m_so = self.m_so.half()
@@ -138,8 +145,9 @@ class KISFusionRetriever:
         if self.m_nllb is not None:
             return 0.0
         started = perf_counter()
-        self.m_nllb, _, _ = self.open_clip.create_model_and_transforms(
-            "nllb-clip-large-siglip", pretrained="v1")
+        self.m_nllb, _, _ = create_model_and_transforms_local(
+            self.open_clip, "nllb-clip-large-siglip"
+        )
         self.m_nllb = self.m_nllb.to(self.dev).eval()
         if self.dev == "cuda":
             self.m_nllb = self.m_nllb.half()

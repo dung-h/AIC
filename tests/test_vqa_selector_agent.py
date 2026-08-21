@@ -134,6 +134,30 @@ def test_routed_compatibility_allocator_keeps_required_specialist_anchor():
     assert all(row["source"] == "asr" for row in selected)
 
 
+def test_localized_specialist_event_beats_broad_context_in_same_video():
+    """A local quote/event proof must not lose to a generic ASR context row."""
+    result = allocate_recall_preserving_candidates(
+        [
+            {
+                "video_id": "V1", "kf_n": 30, "frame_idx": 300,
+                "source": "asr", "modality_score": 0.99,
+                "retrieval_rank": 1, "text": "broad entity context",
+            },
+            {
+                "video_id": "V1", "kf_n": 8, "frame_idx": 80,
+                "source": "asr", "modality_score": 0.70,
+                "retrieval_rank": 2, "text": "literal requested quote",
+                "localized_evidence": True,
+            },
+        ],
+        ["V1"], max_vlm_candidates=1,
+        specialist_modalities=["asr"], specialist_reservation=0,
+        temporal_reservation=0,
+    )
+
+    assert [(row["video_id"], row["kf_n"]) for row in result] == [("V1", 8)]
+
+
 def test_routed_compatibility_allocator_deduplicates_before_budgeting():
     """A duplicate specialist hit cannot consume a second budget slot."""
     candidates = [

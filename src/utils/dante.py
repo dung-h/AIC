@@ -105,14 +105,17 @@ def sequence_quality(normalized_scores, path, pts_times=None, *,
     }
 
 
-def dante_align(S, lam=0.005, valid_mask=None):
+def dante_align(S, lam=0.005, valid_mask=None, timeline_times=None):
     """
     S: (N, T) similarity matrix cho 1 video (N sub-events, T keyframes cùng video).
     Trả: best_score, path (list N chỉ số keyframe, tăng dần).
 
     ``valid_mask`` is optional and is used by the opt-in visual candidate
-    lattice.  With the default ``None`` the original full-frame behavior is
-    preserved.
+    lattice. ``timeline_times`` optionally supplies one strictly increasing,
+    finite canonical timestamp per timeline column. When supplied, the
+    temporal penalty is measured in those time units rather than column
+    positions. With ``timeline_times=None`` the historical index-based
+    behavior is preserved.
     """
     S = np.asarray(S, dtype=np.float64)
     if S.ndim != 2:
@@ -120,6 +123,22 @@ def dante_align(S, lam=0.005, valid_mask=None):
     N, T = S.shape
     if N < 1 or T < 1:
         return -1e9, None
+    try:
+        lam = float(lam)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("lam must be a finite non-negative number") from exc
+    if not np.isfinite(lam) or lam < 0:
+        raise ValueError("lam must be a finite non-negative number")
+    if timeline_times is None:
+        timeline = np.arange(T, dtype=np.float64)
+    else:
+        timeline = np.asarray(timeline_times, dtype=np.float64)
+        if timeline.ndim != 1 or timeline.shape[0] != T:
+            raise ValueError("timeline_times must contain one timestamp per score column")
+        if not np.all(np.isfinite(timeline)):
+            raise ValueError("timeline_times must be finite")
+        if np.any(timeline[1:] <= timeline[:-1]):
+            raise ValueError("timeline_times must be strictly increasing")
     if valid_mask is not None:
         valid_mask = np.asarray(valid_mask, dtype=bool)
         if valid_mask.shape != S.shape:
@@ -134,15 +153,17 @@ def dante_align(S, lam=0.005, valid_mask=None):
     BP = np.full((N, T), -1, dtype=np.int32)  # backpointer
     DP[0] = np.where(valid_mask[0], S[0], -np.inf)
     for i in range(1, N):
-        # running max của (DP[i-1, τ] + λτ) cho τ < t
+        # running max của (DP[i-1, τ] + λ*time[τ]) cho τ < t.
+        # ``timeline`` is positional only when no canonical timestamps were
+        # supplied, preserving historical callers exactly.
         best_val = -np.inf; best_tau = -1
         for t in range(T):
             # cập nhật bằng τ = t-1 trước khi dùng cho t (đảm bảo τ < t)
             if (t-1 >= 0 and np.isfinite(DP[i-1, t-1])
-                    and DP[i-1, t-1] + lam*(t-1) > best_val):
-                best_val = DP[i-1, t-1] + lam*(t-1); best_tau = t-1
+                    and DP[i-1, t-1] + lam*timeline[t-1] > best_val):
+                best_val = DP[i-1, t-1] + lam*timeline[t-1]; best_tau = t-1
             if best_tau >= 0 and valid_mask[i, t]:
-                DP[i, t] = S[i, t] + best_val - lam*t
+                DP[i, t] = S[i, t] + best_val - lam*timeline[t]
                 BP[i, t] = best_tau
     # nghiệm tốt nhất ở hàng cuối
     if not np.any(np.isfinite(DP[N-1])):

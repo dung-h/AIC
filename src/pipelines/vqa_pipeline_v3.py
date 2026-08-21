@@ -25,6 +25,7 @@ from src.reranking.query_routing_policy import (
     canonical_question_type,
 )
 from src.reranking.video_rrf import weighted_video_rrf
+from src.reranking.modality_index_registry import ModalityIndexRegistry
 from src.vqa.evidence_fusion import (
     answer_is_submission_safe,
     build_evidence_packet,
@@ -42,23 +43,110 @@ from src.vqa.selector import (
     selector_metrics,
     stage_record,
 )
+from src.vqa.image_grounding import (
+    ImageGroundingRequest,
+    ImageGroundingResult,
+    image_grounding_eligibility,
+)
+from src.vqa.query_planner import build_vqa_query_plan
+from src.vqa.retrieval_fanout import run_retrieval_fanout
 
 VLM_PROVIDER = provider_for("vision")
 KEY = VLM_PROVIDER.api_key
 BASE = VLM_PROVIDER.base_url
 KF_DIR = str(KEYFRAMES_DIR)
 IDX = str(INDEX_DIR)
-# Conservative specialist weights selected by the fixed dev sweep.  Visual
-# remains the ranking authority unless ASR/OCR has enough rank evidence to
-# move a video without regressing visual R@20 on holdout.
-DEFAULT_RRF_WEIGHTS = {"asr": 0.1, "ocr": 0.05}
+# RoutingConfig.baseline() is the one source of truth for default modality
+# weights.  Do not keep a second set of tiny ASR/OCR constants here: doing so
+# silently overwrites the task-aware plan and makes a declared primary text
+# modality unable to rescue the correct video.
 SUPPORTED_QUESTION_TYPES = frozenset({
     "color", "screen_text", "action", "count", "place", "person",
-    "spoken_fact", "temporal_relation",
+    "spoken_fact", "temporal_relation", "unknown",
 })
 SELECTOR_POLICIES = frozenset({
     "legacy", "balanced", "adaptive", "anchor_preserving",
 })
+
+
+def _fuse_visual_with_image_grounding(
+    visual_rows,
+    image_candidates,
+    *,
+    topk: int,
+    rrf_k: int = 60,
+) -> tuple[list[tuple], list[dict]]:
+    """RRF web-image *local hits* with visual text retrieval at video level.
+
+    Only the local VKIS candidates enter this function.  A source web image is
+    never represented as a frame candidate.  Returning a conventional visual
+    tuple keeps the downstream VQA allocator unchanged while the accompanying
+    trace makes the rescue visible to benchmarking and audit code.
+    """
+    baseline = list(visual_rows or ())
+    grounded = list(image_candidates or ())
+    if not grounded:
+        return baseline, []
+    if topk < 1 or rrf_k < 0:
+        raise ValueError("topk must be positive and rrf_k must be non-negative")
+
+    visual_best: dict[str, tuple[int, tuple]] = {}
+    for rank, row in enumerate(baseline, 1):
+        if not isinstance(row, (tuple, list)) or len(row) < 4:
+            raise ValueError("visual retrieval must yield (video_id, frame_idx, pts_time, score)")
+        video_id = str(row[0]).strip()
+        if video_id and video_id not in visual_best:
+            visual_best[video_id] = (rank, tuple(row[:4]))
+    image_best: dict[str, tuple[int, tuple, dict]] = {}
+    for fallback_rank, candidate in enumerate(grounded, 1):
+        if hasattr(candidate, "to_dict"):
+            candidate = candidate.to_dict()
+        if not isinstance(candidate, dict):
+            raise TypeError("image grounding candidates must be mappings or ImageGroundingCandidate")
+        video_id = str(candidate.get("video_id", "")).strip()
+        if not video_id:
+            continue
+        try:
+            rank = int(candidate.get("rank", fallback_rank))
+            row = (
+                video_id,
+                int(candidate["frame_idx"]),
+                float(candidate["pts_time"]),
+                float(candidate["score"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid local image grounding candidate") from exc
+        if rank < 1:
+            raise ValueError("image grounding rank must be positive")
+        current = image_best.get(video_id)
+        if current is None or rank < current[0]:
+            image_best[video_id] = (rank, row, dict(candidate))
+
+    fused: list[dict] = []
+    for video_id in sorted(set(visual_best) | set(image_best)):
+        visual = visual_best.get(video_id)
+        image = image_best.get(video_id)
+        score = 0.0
+        if visual is not None:
+            score += 1.0 / (rrf_k + visual[0])
+        if image is not None:
+            score += 1.0 / (rrf_k + image[0])
+        representative = visual[1] if visual is not None else image[1]
+        fused.append({
+            "video_id": video_id,
+            "row": representative,
+            "rrf_score": score,
+            "visual_rank": visual[0] if visual is not None else None,
+            "external_image_rank": image[0] if image is not None else None,
+            "external_image_candidate": image[2] if image is not None else None,
+        })
+    fused.sort(key=lambda item: (
+        -float(item["rrf_score"]),
+        int(item["visual_rank"] or 10**9),
+        int(item["external_image_rank"] or 10**9),
+        str(item["video_id"]),
+    ))
+    return [tuple(item["row"]) for item in fused[:topk]], fused[:topk]
 
 
 def normalize_question_type(value):
@@ -116,6 +204,9 @@ def infer_question_type(query, question):
         return "place"
     if any(cue in text for cue in ("who is", "who was", "which person", "nguoi nao", "ai la", "ai dang")):
         return "person"
+    # This helper remains a semantic classifier for direct callers.  The
+    # production composition root deliberately treats missing contracts as
+    # ``unknown`` and enables bounded parallel support lanes instead.
     return "action"
 
 
@@ -124,7 +215,9 @@ class VQAPipelineV3:
 
     def __init__(self, translate=True, offline_vlm=False, local_vlm_path=None,
                  local_vlm_4bit=False, answer_provider=None,
-                 evidence_verifier=None, kis_retriever=None):
+                 evidence_verifier=None, kis_retriever=None,
+                 hypothesis_generator=None, semantic_evidence_judge=None,
+                 asr_global_dir=None):
         # ``kis_retriever`` is a deliberate dependency-injection seam for the
         # offline Q&A retrieval benchmark.  The normal production path keeps
         # constructing KISFusionRetriever exactly as before; the benchmark can
@@ -136,27 +229,106 @@ class VQAPipelineV3:
         self._ocr = None  # lazy
         self._asr_by_video = None
         self._ocr_by_video = None
+        self._asr_context_source = None
+        self._asr_global_dir = asr_global_dir
         self._context_cache_stats = {"asr_video_hits": 0, "asr_video_misses": 0,
                                      "ocr_video_hits": 0, "ocr_video_misses": 0}
         self._local_vlm = None
         self.answer_provider = answer_provider
         self.evidence_verifier = evidence_verifier
+        # Both are explicit optional capabilities.  They do not have a
+        # lexical/model fallback: an enabled caller must inject a concrete
+        # component, otherwise the request fails rather than silently using a
+        # different reasoning policy.
+        self.hypothesis_generator = hypothesis_generator
+        self.semantic_evidence_judge = semantic_evidence_judge
         if offline_vlm:
             from src.core.local_vlm import LocalVLM
             path = local_vlm_path or os.path.join(os.path.dirname(ROOT), "..", "models", "Qwen2.5-VL-3B-Instruct")
             self._local_vlm = LocalVLM(os.path.abspath(path), load_in_4bit=local_vlm_4bit)
 
     # ---- lazy context indexes -------------------------------------------
+    @staticmethod
+    def _normalise_asr_context_rows(frame, *, source):
+        """Present one validated ASR schema to legacy context consumers.
+
+        Retrieval's authoritative ASR snapshot uses ``text``/``video_id``;
+        older diagnostic shards use ``chunk``/``vid``.  Answering must not
+        silently see a different (or smaller) corpus than retrieval, so this
+        adapter preserves a single internal ``chunk``/``vid`` contract.
+        """
+        columns = set(frame.columns)
+        if {"text", "video_id", "start", "end"}.issubset(columns):
+            context = frame.loc[:, ["text", "video_id", "start", "end"]].rename(
+                columns={"text": "chunk", "video_id": "vid"}
+            )
+        elif {"chunk", "vid", "start", "end"}.issubset(columns):
+            context = frame.loc[:, ["chunk", "vid", "start", "end"]].copy()
+        else:
+            raise RuntimeError(
+                f"ASR context source {source} lacks a supported text/video/timestamp schema"
+            )
+        context["chunk"] = context["chunk"].fillna("").astype(str).str.strip()
+        context["vid"] = context["vid"].fillna("").astype(str).str.strip().str.upper()
+        context["start"] = pd.to_numeric(context["start"], errors="coerce")
+        context["end"] = pd.to_numeric(context["end"], errors="coerce")
+        valid = (
+            context["chunk"].ne("")
+            & context["vid"].ne("")
+            & np.isfinite(context["start"])
+            & np.isfinite(context["end"])
+            & (context["start"] >= 0)
+            & (context["end"] >= context["start"])
+        )
+        if not bool(valid.all()):
+            raise RuntimeError(f"ASR context source {source} contains invalid rows")
+        return context.sort_values(["vid", "start", "end"], kind="mergesort").reset_index(drop=True)
+
     def _ensure_asr(self):
         if self._asr is None:
-            frames = []
-            for fp in sorted(glob.glob(os.path.join(IDX, "asr_chunks_*_ts.parquet"))):
+            registry = ModalityIndexRegistry(
+                IDX, global_asr_dir=getattr(self, "_asr_global_dir", None)
+            )
+            global_source = registry.discover_global_asr()
+            if global_source is not None:
+                # A visible merged index is an ownership boundary.  Falling
+                # back to old shards when it is incomplete would let answer
+                # generation use a different corpus from retrieval.
+                if global_source.manifest.get("status") != "ready":
+                    raise RuntimeError(
+                        "merged ASR context index is not ready; refusing legacy fallback"
+                    )
+                if not global_source.retrieval_path.is_file():
+                    raise RuntimeError(
+                        f"merged ASR context retrieval artifact is missing: "
+                        f"{global_source.retrieval_path}"
+                    )
                 try:
-                    frames.append(pd.read_parquet(fp, columns=["chunk", "vid", "start", "end"]))
-                except Exception:
-                    continue
-            self._asr = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-                columns=["chunk", "vid", "start", "end"])
+                    raw = pd.read_parquet(
+                        global_source.retrieval_path,
+                        columns=["text", "video_id", "start", "end"],
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"cannot load merged ASR context artifact "
+                        f"{global_source.retrieval_path}: {exc}"
+                    ) from exc
+                self._asr = self._normalise_asr_context_rows(
+                    raw, source="merged_global_asr"
+                )
+                self._asr_context_source = "merged_global_asr"
+            else:
+                frames = []
+                for fp in sorted(glob.glob(os.path.join(IDX, "asr_chunks_*_ts.parquet"))):
+                    try:
+                        frames.append(self._normalise_asr_context_rows(
+                            pd.read_parquet(fp), source=str(fp)
+                        ))
+                    except Exception:
+                        continue
+                self._asr = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+                    columns=["chunk", "vid", "start", "end"])
+                self._asr_context_source = "legacy_per_pack_asr" if frames else "no_asr_context"
             self._asr_by_video = {
                 str(video_id): group.sort_values(["start", "end"], kind="mergesort").reset_index(drop=True)
                 for video_id, group in self._asr.groupby("vid", sort=False)
@@ -410,7 +582,8 @@ class VQAPipelineV3:
     # ---- context lookups -------------------------------------------------
     def _asr_context(self, video_id, pts_time, window=15.0):
         self._ensure_asr()
-        m = self._asr_by_video.get(str(video_id)) if self._asr_by_video is not None else None
+        canonical_video_id = str(video_id).strip().upper()
+        m = self._asr_by_video.get(canonical_video_id) if self._asr_by_video is not None else None
         if m is None or len(m) == 0:
             self._context_cache_stats["asr_video_misses"] += 1
             return ""
@@ -433,7 +606,8 @@ class VQAPipelineV3:
         return " | ".join(m.ocr_text.head(5).tolist())[:600]
 
     def _build_evidence_packet(self, candidate, query, question,
-                               evidence_provider=None, modalities=None):
+                               evidence_provider=None, modalities=None,
+                               claim_policy=None):
         """Build timestamped evidence from the active retrieval snapshot.
 
         Routed production requests pass the global modality router here so
@@ -452,6 +626,7 @@ class VQAPipelineV3:
                 query,
                 question,
                 modalities=modalities,
+                claim_policy=claim_policy,
             )
         self._ensure_asr()
         self._ensure_ocr()
@@ -764,6 +939,39 @@ class VQAPipelineV3:
         # so a malformed `asr,asr` request cannot run a channel twice.
         return list(dict.fromkeys(value for value in normalized if value in {"asr", "ocr"}))
 
+    @staticmethod
+    def _primary_evidence_sources(question_type, modalities):
+        """Return the specialist source that must support the answer.
+
+        Modality declarations are parallel retrieval lanes, not an
+        intersection requirement on every candidate. A recipe card can be
+        OCR-grounded without speech; a spoken fact can be ASR-grounded while
+        OCR only provides a location/programme cue. Ambiguous multi-source
+        requests fail closed instead of choosing an arbitrary source.
+        """
+        sources = tuple(dict.fromkeys(
+            str(value).strip().lower() for value in modalities
+            if str(value).strip().lower() in {"asr", "ocr"}
+        ))
+        if not sources:
+            return ()
+        canonical = canonical_question_type(question_type)
+        primary = {"spoken_fact": "asr", "screen_text": "ocr"}.get(canonical)
+        if primary is not None:
+            if primary not in sources:
+                raise ValueError(f"{canonical} requires {primary} evidence")
+            return (primary,)
+        if len(sources) == 1:
+            return sources
+        if canonical == "temporal_relation":
+            # An explicit multi-modal annotation is a real contract. Do not
+            # erase it and silently score a temporal relation as visual-only.
+            return sources
+        raise ValueError(
+            "multiple specialist modalities require an explicit screen_text "
+            "or spoken_fact question_type to choose the primary evidence source"
+        )
+
     def _temporal_neighbor_candidates(self, video_id, kf_n, *, radius=2):
         rows = self.km[self.km.video_id.astype(str) == str(video_id)].sort_values("pts_time").reset_index(drop=True)
         positions = np.flatnonzero(rows.kf_n.to_numpy(dtype=np.int64) == int(kf_n))
@@ -781,7 +989,8 @@ class VQAPipelineV3:
         return out
 
     @staticmethod
-    def _attach_evidence_frames(candidates, candidate_pool, *, limit=3):
+    def _attach_evidence_frames(candidates, candidate_pool, *, limit=3,
+                                max_neighbor_distance_s=20.0):
         """Attach bounded, same-video frame evidence to each selected anchor.
 
         Retrieval and selection still produce one canonical answer frame.  The
@@ -828,6 +1037,14 @@ class VQAPipelineV3:
                 kf_n = int(item["kf_n"])
                 if kf_n in seen:
                     continue
+                distance_s = abs(
+                    float(item.get("pts_time", anchor_pts) or anchor_pts) - anchor_pts
+                )
+                # Generic cross-scene frames cannot justify an answer for the
+                # submitted anchor. Long-distance same-video title/name
+                # evidence is allowed only through the explicit role joiner.
+                if distance_s > float(max_neighbor_distance_s):
+                    continue
                 seen.add(kf_n)
                 item_sources = candidate_sources(item)
                 specialist_modality = next(
@@ -843,6 +1060,11 @@ class VQAPipelineV3:
                     "role": "evidence" if specialist_modality is not None
                     else "neighbor",
                     "modality": specialist_modality or item.get("source", "visual"),
+                    "relation": (
+                        "same_frame" if distance_s == 0.0
+                        else "bounded_temporal_neighbor"
+                    ),
+                    "distance_s": distance_s,
                 })
                 if len(evidence_frames) >= max(0, int(limit)):
                     break
@@ -1579,11 +1801,15 @@ class VQAPipelineV3:
                                   frames_per_video: int = 5, max_vlm_candidates: int = 12,
                                   temporal_consensus: bool = True,
                                   required_modalities=None, modality_router=None,
+                                  support_modalities=None,
                                   modality_budget: int = 2, global_modality_router=None,
                                   rrf_weights: dict | None = None,
                                   question_type: str | None = None,
                                   visual_selector_policy: str = "adaptive",
                                   evidence_fusion: bool | None = None,
+                                  grounding_resolver=None,
+                                  image_grounding_provider=None,
+                                  hypothesis_generator=None,
                                   return_candidate_pool: bool = False) -> dict:
         """Materialize bounded visual candidates without loading/using the VLM.
 
@@ -1605,41 +1831,312 @@ class VQAPipelineV3:
             raise ValueError(
                 "visual_selector_policy must be 'anchor_preserving', 'legacy', "
                 "'balanced', or 'adaptive'"
-            )
-        modalities = self._parse_modalities(required_modalities)
-        route_requested = global_modality_router is not None and bool(modalities)
-        visual_retrieved = self.kis.search(
-            query, topk=max(top_videos, 100) if route_requested else top_videos
         )
+        # Required modalities govern answer acceptance.  Support modalities
+        # govern retrieval only.  Keeping the two concepts separate prevents
+        # an uncertain live-query classifier from silently turning ASR/OCR
+        # into a hard requirement (or silently removing a useful lane).
+        declared_modalities = self._parse_modalities(required_modalities)
+        retrieval_modalities = self._parse_modalities(
+            support_modalities if support_modalities is not None else required_modalities
+        )
+        grounding_evidence = ()
+        grounding_enabled = bool(getattr(grounding_resolver, "enabled", False))
+        active_hypothesis_generator = (
+            hypothesis_generator
+            if hypothesis_generator is not None else getattr(self, "hypothesis_generator", None)
+        )
+        hypothesis_enabled = bool(getattr(active_hypothesis_generator, "enabled", False))
+        hypothesis_plan = None
+        hypothesis_status = "disabled"
+        if hypothesis_enabled and not grounding_enabled:
+            raise ValueError(
+                "hypothesis generation requires an enabled external grounding resolver; "
+                "hypotheses cannot directly alter local ranking"
+            )
+        base_query_plan = build_vqa_query_plan(
+            query,
+            question,
+            question_type=question_type or infer_question_type(query, question),
+            modalities=retrieval_modalities,
+            external_grounding_enabled=grounding_enabled,
+        )
+        grounding_attempted = False
+        # Web grounding is reserved for entity/fact/quotation-shaped queries.
+        # Calling it for routine colour/action retrieval makes the route slower
+        # and creates irrelevant aliases that can perturb an otherwise visual
+        # candidate ranking.
+        if grounding_enabled and base_query_plan.external_grounding_eligible:
+            from src.vqa.grounding import GroundingRequest
+            grounding_attempted = True
+            grounding_views = tuple(dict.fromkeys(
+                value
+                for values in base_query_plan.query_fact_views.values()
+                for value in values
+            ))
+            if hypothesis_enabled:
+                from src.vqa.hypothesis_generator import (
+                    HypothesisRequest,
+                    RetrievalHypothesisPlan,
+                )
+                generated = active_hypothesis_generator.generate(
+                    HypothesisRequest(query=query, question=question)
+                )
+                if not isinstance(generated, RetrievalHypothesisPlan):
+                    raise TypeError(
+                        "hypothesis generator must return RetrievalHypothesisPlan"
+                    )
+                hypothesis_plan = generated
+                hypothesis_status = "used"
+                grounding_views = tuple(dict.fromkeys([
+                    *grounding_views,
+                    *generated.grounding_views(),
+                ]))[:4]
+            resolved = grounding_resolver.resolve(GroundingRequest(
+                query, question, hypothesis_views=grounding_views,
+            ))
+            if not isinstance(resolved, (tuple, list)):
+                raise TypeError("grounding resolver must return a sequence of evidence records")
+            grounding_evidence = tuple(resolved)
+        query_plan = build_vqa_query_plan(
+            query,
+            question,
+            question_type=question_type or infer_question_type(query, question),
+            modalities=retrieval_modalities,
+            external_evidence=grounding_evidence,
+            external_grounding_enabled=grounding_enabled,
+            external_grounding_attempted=grounding_attempted,
+        )
+        modalities = list(query_plan.support_modalities)
+        route_requested = global_modality_router is not None and bool(modalities)
+        from src.vqa.claim_verifier import derive_claim_policy
+        retrieval_claim_policy = derive_claim_policy(
+            query, specialist_sources=modalities,
+        )
+        image_grounding_enabled = bool(
+            getattr(image_grounding_provider, "enabled", False)
+        )
+        image_eligible, image_reasons = image_grounding_eligibility(
+            query,
+            question,
+            question_type=question_type or infer_question_type(query, question),
+            specialist_modalities=declared_modalities,
+        )
+        visual_retrieval_topk = (
+            max(top_videos, 100)
+            if route_requested or (image_grounding_enabled and image_eligible)
+            else top_videos
+        )
+        # Visual encoding/search owns the GPU while ASR/OCR search uses the
+        # local text index on CPU.  They are independent candidate generators,
+        # so start them together and join only at the single RRF owner below.
+        # The fan-out result is ordered by channel name, not completion time,
+        # which keeps downstream ranking deterministic.
         specialist_channels = {}
+        retrieval_fanout = None
         if route_requested:
-            specialist_text = f"{query}\n{question}".strip()
+            retrieval_tasks = {
+                "visual": lambda: self.kis.search(query, topk=visual_retrieval_topk),
+            }
             for modality in modalities:
-                specialist_channels[modality] = global_modality_router.global_candidates(
-                    specialist_text, modality, topk=100)
+                views = query_plan.modality_queries.get(
+                    modality, (f"{query}\n{question}",)
+                )
+                multi_view = getattr(global_modality_router, "global_candidates_multi", None)
+                if callable(multi_view):
+                    retrieval_tasks[modality] = (
+                        lambda current_views=views, current_modality=modality:
+                        multi_view(current_views, current_modality, topk=100)
+                    )
+                else:
+                    # Compatibility seam for injected diagnostic routers.
+                    retrieval_tasks[modality] = (
+                        lambda current_modality=modality:
+                        global_modality_router.global_candidates(
+                            f"{query}\n{question}".strip(), current_modality, topk=100
+                        )
+                    )
+            retrieval_fanout = run_retrieval_fanout(retrieval_tasks)
+            baseline_visual_retrieved = list(retrieval_fanout.results["visual"])
+            specialist_channels = {
+                modality: list(retrieval_fanout.results.get(modality, ()))
+                for modality in modalities
+            }
+        else:
+            baseline_visual_retrieved = self.kis.search(
+                query, topk=visual_retrieval_topk
+            )
+        visual_retrieved = list(baseline_visual_retrieved)
+        # An explicit verse request can use a precision ASR-event lane.  The
+        # router joins an ASR recital with nearby same-video ASR/OCR context;
+        # it never creates an answer or a non-canonical frame.
+        poetry_global_candidates = []
+        poetry_global_trace = {"status": "not_requested", "count": 0}
+        if route_requested and "asr" in modalities:
+            global_poetry = getattr(global_modality_router, "global_poetry_event_candidates", None)
+            if callable(global_poetry):
+                try:
+                    poetry_global_candidates = [
+                        item for item in (global_poetry(query, question, topk=20) or ())
+                        if isinstance(item, dict)
+                    ]
+                    poetry_global_trace = {
+                        "status": (
+                            "candidates" if poetry_global_candidates else "not_eligible_or_no_event"
+                        ),
+                        "count": len(poetry_global_candidates),
+                    }
+                except Exception as exc:
+                    # This supplemental lane must not disguise the state of
+                    # the independently preflighted visual/ASR/OCR paths.
+                    poetry_global_trace = {
+                        "status": "unavailable", "count": 0,
+                        "error": f"{type(exc).__name__}: {exc}"[:240],
+                    }
+        image_grounding = {
+            "enabled": image_grounding_enabled,
+            "eligible": bool(image_eligible),
+            "reasons": list(image_reasons),
+            "attempted": False,
+            "status": "disabled_by_default" if not image_grounding_enabled else "not_eligible",
+            "reference_count": 0,
+            "candidate_count": 0,
+            "references": [],
+        }
+        image_candidates = []
+        image_visual_fusion = []
+        if image_grounding_enabled and image_eligible:
+            image_grounding["attempted"] = True
+            result = image_grounding_provider.retrieve(
+                ImageGroundingRequest(query, question), topk=100
+            )
+            if not isinstance(result, ImageGroundingResult):
+                raise TypeError("image grounding provider must return ImageGroundingResult")
+            image_candidates = [candidate.to_dict() for candidate in result.candidates]
+            image_grounding.update(result.to_dict())
+            if image_candidates:
+                visual_retrieved, image_visual_fusion = _fuse_visual_with_image_grounding(
+                    baseline_visual_retrieved,
+                    image_candidates,
+                    topk=visual_retrieval_topk,
+                )
+        claim_candidates = []
+        if route_requested:
+            claim_retriever = getattr(global_modality_router, "global_claim_candidates", None)
+            if retrieval_claim_policy.active and callable(claim_retriever):
+                claim_candidates = list(claim_retriever(
+                    retrieval_claim_policy,
+                    modalities,
+                    topk_per_claim=100,
+                ) or ())
         specialist_hits = {
             modality: bool(specialist_channels.get(modality)) for modality in modalities
         }
+
+        def _channel_trace(rows, *, limit=20):
+            """Keep a bounded trace of real rows before fusion and selection."""
+            output = []
+            for item in list(rows or ())[:max(0, int(limit))]:
+                if not isinstance(item, dict):
+                    continue
+                record = {
+                    key: item.get(key)
+                    for key in (
+                        "video_id", "kf_n", "frame_idx", "pts_time", "rank",
+                        "modality", "modality_score", "score_mode",
+                    )
+                    if item.get(key) is not None
+                }
+                provenance = item.get("view_provenance", ()) or ()
+                if provenance:
+                    record["view_provenance"] = [
+                        {
+                            key: value.get(key)
+                            for key in ("query_view", "score_mode", "rank", "score", "weight")
+                            if value.get(key) is not None
+                        }
+                        for value in provenance[:8]
+                        if isinstance(value, dict)
+                    ]
+                evidence = str(item.get("text", "") or "").strip()
+                if evidence:
+                    # Context for diagnosis only; never an answer field.
+                    record["evidence_preview"] = evidence[:240]
+                output.append(record)
+            return output
+
+        routing_trace = {
+            "required_modalities": list(declared_modalities),
+            "support_modalities": list(modalities),
+            "visual_top_videos": [str(row[0]) for row in visual_retrieved[:20]],
+            "specialist_channels": {
+                modality: {
+                    "candidate_count": len(specialist_channels.get(modality, [])),
+                    "top_candidates": _channel_trace(specialist_channels.get(modality, [])),
+                }
+                for modality in modalities
+            },
+            "claim_channel": {
+                "active": retrieval_claim_policy.active,
+                "policy": retrieval_claim_policy.to_dict(),
+                "candidate_count": len(claim_candidates),
+                "top_candidates": _channel_trace(claim_candidates),
+            },
+            "poetry_event_channel": {
+                **poetry_global_trace,
+                "top_candidates": _channel_trace(poetry_global_candidates),
+            },
+            "retrieval_fanout": (
+                retrieval_fanout.to_dict() if retrieval_fanout is not None else {
+                    "channels": ["visual"],
+                    "parallel": False,
+                    "status": "visual_only",
+                }
+            ),
+        }
         inferred_type = question_type
         if not inferred_type:
-            if modalities == ["asr"]:
+            if declared_modalities == ["asr"]:
                 inferred_type = "spoken_fact"
-            elif modalities == ["ocr"]:
+            elif declared_modalities == ["ocr"]:
                 inferred_type = "screen_text"
-            elif len(modalities) > 1:
+            elif len(declared_modalities) > 1:
                 inferred_type = "temporal_relation"
             else:
                 inferred_type = "unknown"
-        if canonical_question_type(inferred_type) == "visual" and modalities:
+        if canonical_question_type(inferred_type) == "visual" and declared_modalities:
             inferred_type = (
-                "spoken_fact" if modalities == ["asr"] else
-                "screen_text" if modalities == ["ocr"] else
+                "spoken_fact" if declared_modalities == ["asr"] else
+                "screen_text" if declared_modalities == ["ocr"] else
                 "temporal_relation"
             )
         primary_specialist = {
             "spoken_fact": "asr",
             "screen_text": "ocr",
         }.get(canonical_question_type(inferred_type))
+        # Required modalities are an answer contract.  Additional ASR/OCR
+        # lanes are retrieval support only, so a missing secondary lane must
+        # not make a correctly grounded primary route look like a failure.
+        required_route_satisfied = (
+            all(bool(specialist_hits.get(modality)) for modality in declared_modalities)
+            if declared_modalities else any(specialist_hits.values())
+        )
+        route_state = (
+            "specialist_success" if route_requested and required_route_satisfied else
+            ("specialist_partial" if route_requested and any(specialist_hits.values()) else
+             ("specialist_no_hit" if route_requested else "baseline_success"))
+        )
+        # The answer contract chooses which specialist is authoritative.  The
+        # other lane remains useful retrieval support, but must not win a
+        # same-video allocator tie merely because ``asr`` happens to sort
+        # before ``ocr``.  This matters for screen_text: an ASR context frame
+        # may be plausible while the OCR recipe card carries the answer.
+        selector_specialist_modalities = tuple(
+            [primary_specialist] + [
+                modality for modality in modalities if modality != primary_specialist
+            ]
+        ) if primary_specialist else tuple(modalities)
+        routing_trace["selector_specialist_order"] = list(selector_specialist_modalities)
         route_active = route_requested and (
             bool(specialist_hits.get(primary_specialist))
             if primary_specialist else any(specialist_hits.values())
@@ -1654,6 +2151,8 @@ class VQAPipelineV3:
         evidence_fusion_active = route_active if evidence_fusion is None else bool(evidence_fusion)
         if route_active:
             channels = {"visual": visual_retrieved, **specialist_channels}
+            if poetry_global_candidates:
+                channels["poetry"] = poetry_global_candidates
             # Resolve the task-aware policy once at the retrieval boundary.
             # Explicit modality requirements remain authoritative when a
             # caller supplies no/contradictory annotation type.
@@ -1662,11 +2161,29 @@ class VQAPipelineV3:
                 key: dict(value) for key, value in base_config.weights_by_type.items()
             }
             policy_type = canonical_question_type(inferred_type)
-            tuned_weights = dict(DEFAULT_RRF_WEIGHTS)
-            tuned_weights.update(rrf_weights or {})
-            for modality in modalities:
-                if modality in tuned_weights:
-                    weights_by_type[policy_type][modality] = float(tuned_weights[modality])
+            # ``RoutingConfig.baseline`` owns the production defaults.  A
+            # caller may override them only explicitly for a recorded dev
+            # sweep; never overwrite them with a hidden second default.
+            if rrf_weights:
+                if not isinstance(rrf_weights, dict):
+                    raise TypeError("rrf_weights must be a mapping when provided")
+                allowed_channels = set(weights_by_type[policy_type])
+                unknown_channels = set(rrf_weights) - allowed_channels
+                if unknown_channels:
+                    raise ValueError(
+                        "rrf_weights contains channels outside the active routing plan: "
+                        + ", ".join(sorted(str(value) for value in unknown_channels))
+                    )
+                for modality, value in rrf_weights.items():
+                    try:
+                        weight = float(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"rrf_weights[{modality!r}] must be numeric") from exc
+                    if not math.isfinite(weight) or weight < 0:
+                        raise ValueError(
+                            f"rrf_weights[{modality!r}] must be finite and non-negative"
+                        )
+                    weights_by_type[policy_type][str(modality)] = weight
             policy_config = RoutingConfig(
                 enabled=True,
                 weights_by_type=weights_by_type,
@@ -1698,9 +2215,33 @@ class VQAPipelineV3:
             # the owner directly here so this production path cannot drift to
             # a second video-level fusion implementation.
             gate = routing_plan.rescue_gate
+            active_weights = {
+                channel: float(weight)
+                for channel, weight in routing_plan.weights.items()
+                if channel in channels
+            }
+            if claim_candidates:
+                # Claim coverage is a proof over every query-side condition,
+                # not a fourth embedding model. Its weight is bounded by the
+                # strongest already-approved specialist lane and all of its
+                # rows remain evidence-gated by weighted_video_rrf.
+                specialist_weights = [
+                    float(active_weights.get(modality, 0.0))
+                    for modality in modalities
+                ]
+                claim_weight = max(specialist_weights, default=0.0)
+                if claim_weight > 0.0:
+                    channels["claim"] = claim_candidates
+                    active_weights["claim"] = claim_weight
+                    routing_plan_record["claim_channel"] = {
+                        "enabled": True,
+                        "weight": claim_weight,
+                        "candidate_count": len(claim_candidates),
+                    }
+            routing_plan_record["active_weights"] = dict(active_weights)
             fused_videos = weighted_video_rrf(
                 channels,
-                dict(routing_plan.weights),
+                active_weights,
                 rrf_k=routing_plan.rrf_k,
                 topk=routing_plan.output_top_k,
                 visual_channel="visual",
@@ -1712,27 +2253,137 @@ class VQAPipelineV3:
                 require_specialist_evidence=gate.require_evidence and gate.enabled,
                 evidence_keys=gate.evidence_keys,
                 specialist_rescue_enabled=gate.enabled,
+                # Keep the pipeline call in sync with the policy owner.  A
+                # direct call here previously bypassed the evidence-aware
+                # rescue parameters added to ``weighted_video_rrf``; exact
+                # OCR/ASR evidence at rank 6--20 therefore could never save
+                # a wrong visual shortlist in production.
+                evidence_aware_rescue_enabled=(
+                    gate.enabled and gate.evidence_aware_rescue_enabled
+                ),
+                evidence_aware_max_rank=gate.evidence_aware_max_rank,
+                provenance_max_rank=gate.provenance_max_rank,
+                provenance_min_score=gate.provenance_min_score,
+                provenance_modes=gate.provenance_modes,
             )
+            routing_trace["rrf_output"] = [
+                {
+                    key: row.get(key)
+                    for key in (
+                        "video_id", "video_rank", "rrf_score", "rrf_guard",
+                        "rrf_guard_reason", "visual_rank", "asr_rank", "ocr_rank",
+                    )
+                    if row.get(key) is not None
+                }
+                for row in fused_videos
+            ]
             video_ids = [str(row["video_id"]) for row in fused_videos]
         else:
             fused_videos = []
+            routing_trace["rrf_output"] = []
             video_ids = [str(row[0]) for row in visual_retrieved]
             routing_plan = None
             routing_plan_record = None
+
+        # A global hit identifies promising videos; it is not necessarily the
+        # answer timestamp.  For a quote/fact/numeric anchor, re-search the
+        # already selected videos with all query views and keep the returned
+        # canonical rows as *additional* evidence candidates.  This cannot
+        # change RRF video order and cannot fabricate a frame.
+        localized_channels = {modality: [] for modality in modalities}
+        localization_trace = {modality: {"status": "not_requested", "count": 0}
+                              for modality in modalities}
+        localize = getattr(global_modality_router, "localize_evidence", None)
+        quote_anchors = tuple(getattr(query_plan, "quote_anchors", ()) or ())
+        if not quote_anchors:
+            quote_anchors = tuple(
+                dict.fromkeys(
+                    value
+                    for values in (getattr(query_plan, "quote_views", {}) or {}).values()
+                    for value in values
+                    if str(value).strip()
+                )
+            )
+        if not quote_anchors:
+            quote_anchors = tuple(getattr(query_plan, "exact_anchors", ()) or ())
+        should_localize = bool(
+            route_active and video_ids and callable(localize)
+            and (quote_anchors or bool(getattr(query_plan, "external_evidence", ())))
+        )
+        if should_localize:
+            for modality in modalities:
+                try:
+                    localized = localize(
+                        modality,
+                        video_ids,
+                        query_plan.modality_queries.get(modality, (f"{query}\n{question}",)),
+                        per_video=3,
+                        quote_anchors=quote_anchors,
+                    )
+                except Exception as exc:
+                    # This is a supplemental localization stage. The existing
+                    # preflighted global route remains authoritative; record
+                    # an unavailable localizer instead of misreporting a
+                    # visual-only answer as localized evidence.
+                    localization_trace[modality] = {
+                        "status": "unavailable", "count": 0,
+                        "error": f"{type(exc).__name__}: {exc}"[:240],
+                    }
+                    continue
+                localized_channels[modality] = [
+                    item for item in (localized or ()) if isinstance(item, dict)
+                ]
+                localization_trace[modality] = {
+                    "status": "localized", "count": len(localized_channels[modality]),
+                    "quote_anchor_count": len(quote_anchors),
+                }
+        elif route_active and callable(localize):
+            for modality in modalities:
+                localization_trace[modality] = {
+                    "status": "not_anchor_eligible", "count": 0,
+                    "quote_anchor_count": len(quote_anchors),
+                }
+        routing_trace["localization"] = localization_trace
+
+        # A poetry question may name only the historical subject, not the
+        # verse itself.  Treat it as a distinct, local temporal event: after
+        # video RRF has selected a video, inspect canonical ASR chunks for a
+        # short consecutive recitation with nearby subject context.  This is
+        # not an external-answer path and never gets a vote in video fusion.
+        poetry_trace = {"status": "not_requested", "count": 0}
+        localize_poetry = getattr(global_modality_router, "localize_poetry_event", None)
+        if route_active and "asr" in modalities and callable(localize_poetry):
+            try:
+                poetry_rows = list(localize_poetry(
+                    video_ids, query, question, per_video=4
+                ) or ())
+                localized_channels.setdefault("asr", []).extend(
+                    item for item in poetry_rows if isinstance(item, dict)
+                )
+                poetry_trace = {
+                    "status": "localized" if poetry_rows else "no_local_event",
+                    "count": len(poetry_rows),
+                    "diagnostic": dict(getattr(
+                        global_modality_router, "last_poetry_event_diagnostic", {}
+                    ) or {}),
+                }
+            except Exception as exc:
+                poetry_trace = {
+                    "status": "unavailable", "count": 0,
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                }
+        routing_trace["poetry_event_localization"] = poetry_trace
         if not video_ids:
             return {
                 "query": query, "question": question, "candidates": [],
                 "retrieved_video_ids": [], "visual_retrieved_video_ids": [],
+                "baseline_visual_retrieved_video_ids": [],
                 "status": "no_retrieval", "candidate_count": 0,
                 "vlm_candidate_count": 0, "modality_route": modalities,
                 "route_requested": route_requested, "route_active": route_active,
                 "candidate_state": "candidate_miss", "candidate_miss": True,
                 "wrong_video_state": "not_evaluated", "wrong_video": None,
-                "route_state": (
-                    "specialist_success" if route_requested and all(specialist_hits.values()) else
-                    ("specialist_partial" if route_requested and route_active else
-                     ("specialist_no_hit" if route_requested else "baseline_success"))
-                ),
+                "route_state": route_state,
                 "route_fallback_reason": (
                     None if route_requested and all(specialist_hits.values()) else
                     ("specialist_partial_hit" if route_requested and route_active else
@@ -1741,10 +2392,23 @@ class VQAPipelineV3:
                 "evidence_fusion": evidence_fusion_active,
                 "rrf_videos": fused_videos,
                 "routing_plan": routing_plan_record,
+                "query_plan": query_plan.to_dict(),
+                "hypothesis_plan": (
+                    hypothesis_plan.to_dict() if hypothesis_plan is not None else {
+                        "status": (
+                            "not_eligible" if hypothesis_enabled else hypothesis_status
+                        )
+                    }
+                ),
+                "routing_trace": routing_trace,
+                "image_grounding": image_grounding,
+                "image_visual_fusion": image_visual_fusion,
                 "candidate_source_counts": {}, "specialist_candidate_count": 0,
                 "selector_metrics": selector_metrics([], [], video_ids),
                 "stages": {
                     "retrieval": {"visual_count": len(visual_retrieved),
+                                   "baseline_visual_count": len(baseline_visual_retrieved),
+                                   "external_image_count": len(image_candidates),
                                    "specialist_counts": {
                                        modality: len(specialist_channels.get(modality, []))
                                        for modality in modalities}},
@@ -1771,6 +2435,44 @@ class VQAPipelineV3:
                 diversify=route_active,
             )
         candidates = []
+        # ``visual_retrieved`` is the global KIS decision that admitted a
+        # video to the fused shortlist.  Do not replace that exact frame with
+        # a later per-video local search: the latter is intentionally broad
+        # and can select a neighbouring/context frame.  Preserve this anchor
+        # so broad per-video search cannot replace a globally retrieved match
+        # before the answer stage evaluates it.
+        for global_rank, raw in enumerate(visual_retrieved, 1):
+            try:
+                video_id, _frame_idx, kf_n, score = raw[:4]
+            except (TypeError, ValueError):
+                continue
+            video_id = str(video_id)
+            if video_id not in video_rank:
+                continue
+            rows = self.km[(self.km.video_id.astype(str) == video_id) &
+                           (self.km.kf_n == int(kf_n))]
+            if rows.empty:
+                continue
+            row = rows.iloc[0]
+            frame_path = self._frame_path(video_id, int(row.kf_n))
+            if not os.path.exists(frame_path):
+                continue
+            candidates.append({
+                "video_id": video_id,
+                "frame_idx": int(row.frame_idx),
+                "kf_n": int(row.kf_n),
+                "pts_time": float(row.pts_time),
+                "base_score": float(score),
+                "video_rank": video_rank[video_id],
+                "frame_path": frame_path,
+                "source": "visual",
+                "retrieval_rank": global_rank,
+                "visual_video_rank": global_rank,
+                # Rank before local lattice rows while retaining the global
+                # similarity score as the actual within-video tie breaker.
+                "visual_frame_rank": 0,
+                "global_visual_anchor": True,
+            })
         for lattice_rank, (video_id, frame_idx, kf_n, base_score) in enumerate(lattice, 1):
             rows = self.km[(self.km.video_id.astype(str) == str(video_id)) &
                            (self.km.kf_n == int(kf_n))]
@@ -1795,6 +2497,40 @@ class VQAPipelineV3:
                 visual_candidate["_canonical_frame_remapped"] = True
                 visual_candidate["_input_frame_idx"] = int(frame_idx)
             candidates.append(visual_candidate)
+
+        # Preserve the exact local frame selected by image-to-image retrieval
+        # as an additional candidate. The row is accepted only after the same
+        # canonical map used by all VQA output; the remote reference image is
+        # not retained as a candidate and cannot enter the submission.
+        for extra in image_candidates:
+            video_id = str(extra.get("video_id", "")).strip()
+            if video_id not in video_rank:
+                continue
+            try:
+                frame_idx = int(extra["frame_idx"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows = self.km[(self.km.video_id.astype(str) == video_id) &
+                           (self.km.frame_idx == frame_idx)]
+            if rows.empty:
+                continue
+            row = rows.iloc[0]
+            frame_path = self._frame_path(video_id, int(row.kf_n))
+            if not os.path.exists(frame_path):
+                continue
+            candidates.append({
+                "video_id": video_id,
+                "frame_idx": int(row.frame_idx),
+                "kf_n": int(row.kf_n),
+                "pts_time": float(row.pts_time),
+                "base_score": float(extra.get("score", 0.0)),
+                "video_rank": video_rank[video_id],
+                "frame_path": frame_path,
+                "source": "external_image",
+                "retrieval_rank": int(extra.get("rank", 10**9)),
+                "external_image_score": float(extra.get("score", 0.0)),
+                "reference_urls": list(extra.get("reference_urls", ())),
+            })
 
         if route_active:
             # Add global specialist frames and temporal neighbors. Specialist
@@ -1824,8 +2560,8 @@ class VQAPipelineV3:
                             "modality_score": float(extra["modality_score"]),
                             "score_mode": extra.get("score_mode"),
                             "text": extra.get("text", ""),
-                            "evidence": extra.get("evidence"),
-                        })
+                                "evidence": extra.get("evidence"),
+                            })
                     if extras:
                         anchor = extras[0]
                         for neighbor in self._temporal_neighbor_candidates(video_id, anchor["kf_n"]):
@@ -1835,6 +2571,121 @@ class VQAPipelineV3:
                             neighbor.update({"video_rank": video_rank[neighbor["video_id"]],
                                              "frame_path": frame_path})
                             candidates.append(neighbor)
+            # The event lane still provides ASR answer evidence.  Preserve
+            # its distinct provenance for RRF/audit, but do not create a new
+            # answer modality or let it bypass the canonical frame boundary.
+            for extra in poetry_global_candidates:
+                video_id = str(extra.get("video_id", "")).strip()
+                if video_id not in video_rank:
+                    continue
+                try:
+                    kf_n = int(extra["kf_n"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                rows = self.km[(self.km.video_id.astype(str) == video_id) &
+                               (self.km.kf_n == kf_n)]
+                if rows.empty:
+                    continue
+                row = rows.iloc[0]
+                frame_path = self._frame_path(video_id, kf_n)
+                if not os.path.exists(frame_path):
+                    continue
+                score = float(extra.get("modality_score", extra.get("score", 0.0)))
+                candidates.append({
+                    "video_id": video_id,
+                    "frame_idx": int(row.frame_idx),
+                    "kf_n": kf_n,
+                    "pts_time": float(row.pts_time),
+                    "base_score": score,
+                    "video_rank": video_rank[video_id],
+                    "frame_path": frame_path,
+                    "source": "asr",
+                    "sources": ["asr", "poetry"],
+                    "retrieval_rank": extra.get("rank"),
+                    "modality_score": score,
+                    "score_mode": str(extra.get("score_mode", "global_asr_poetry_event")),
+                    "text": extra.get("text", ""),
+                    "evidence": extra.get("evidence"),
+                    "event_provenance": dict(extra.get("provenance", {}) or {}),
+                    "view_provenance": list(extra.get("view_provenance", ()) or ()),
+                    "localized_evidence": True,
+                })
+            # A claim candidate only recovers a video; its representative
+            # canonical row is still real ASR/OCR evidence from that video.
+            # Add it to the frame lattice so a rescued video cannot disappear
+            # before selector/answer verification.
+            for extra in claim_candidates:
+                video_id = str(extra.get("video_id", ""))
+                if video_id not in video_rank:
+                    continue
+                try:
+                    kf_n = int(extra["kf_n"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                rows = self.km[(self.km.video_id.astype(str) == video_id) &
+                               (self.km.kf_n == kf_n)]
+                if rows.empty:
+                    continue
+                row = rows.iloc[0]
+                frame_path = self._frame_path(video_id, kf_n)
+                if not os.path.exists(frame_path):
+                    continue
+                candidates.append({
+                    "video_id": video_id, "frame_idx": int(row.frame_idx),
+                    "kf_n": kf_n, "pts_time": float(row.pts_time),
+                    "base_score": float(extra.get("modality_score", 0.0)),
+                    "video_rank": video_rank[video_id], "frame_path": frame_path,
+                    "source": str(extra.get("claim_modality", "claim")),
+                    "sources": ["claim", str(extra.get("claim_modality", "claim"))],
+                    "retrieval_rank": extra.get("rank"),
+                    "modality_score": float(extra.get("modality_score", 0.0)),
+                    "score_mode": "claim_coverage",
+                    "text": extra.get("text", ""),
+                    "evidence": extra.get("evidence"),
+                    "claim_coverage": list(extra.get("claim_coverage", ()) or ()),
+                })
+            # Localized rows are scoped to the already fused video list. They
+            # are never a video rescue themselves; their job is to replace a
+            # broad context frame with a timestamp that actually contains a
+            # quote, name, or numeric anchor.
+            for modality in modalities:
+                for extra in localized_channels.get(modality, []):
+                    video_id = str(extra.get("video_id", "")).strip()
+                    if video_id not in video_rank:
+                        continue
+                    try:
+                        kf_n = int(extra["kf_n"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    rows = self.km[(self.km.video_id.astype(str) == video_id) &
+                                   (self.km.kf_n == kf_n)]
+                    if rows.empty:
+                        continue
+                    row = rows.iloc[0]
+                    frame_path = self._frame_path(video_id, kf_n)
+                    if not os.path.exists(frame_path):
+                        continue
+                    candidates.append({
+                        "video_id": video_id, "frame_idx": int(row.frame_idx),
+                        "kf_n": kf_n, "pts_time": float(row.pts_time),
+                        "base_score": float(extra.get("modality_score", 0.0)),
+                        "video_rank": video_rank[video_id], "frame_path": frame_path,
+                        "source": modality,
+                        "retrieval_rank": extra.get("rank_within_video"),
+                        "modality_score": float(extra.get("modality_score", 0.0)),
+                        "score_mode": extra.get("score_mode", "shortlist_localization"),
+                        "text": extra.get("text", ""),
+                        "evidence": extra.get("evidence"),
+                        "view_provenance": list(extra.get("view_provenance", ()) or ()),
+                        "quote_anchor_provenance": list(
+                            extra.get("quote_anchor_provenance", ()) or ()
+                        ),
+                        # A verse event has its own local temporal/context
+                        # proof. Preserve it for the audit trace without
+                        # confusing it with an external quotation hypothesis.
+                        "event_provenance": dict(extra.get("provenance", {}) or {}),
+                        "localized_evidence": True,
+                    })
         elif modality_router is not None and modalities:
             # Preserve the old diagnostic mode: text candidates are restricted
             # to the frozen visual video list and never alter video ranking.
@@ -1880,7 +2731,7 @@ class VQAPipelineV3:
                     "channel_ranks": {
                         key[:-5]: int(value)
                         for key, value in sorted(fused.items())
-                        if key.endswith("_rank") and key[:-5] in {"visual", "asr", "ocr"}
+                        if key.endswith("_rank") and key[:-5] in {"visual", "asr", "ocr", "poetry"}
                     },
                 }
 
@@ -1916,7 +2767,9 @@ class VQAPipelineV3:
                 candidate_pool,
                 video_ids,
                 max_vlm_candidates,
-                specialist_modalities=modalities if route_active else (),
+                specialist_modalities=(
+                    selector_specialist_modalities if route_active else ()
+                ),
                 per_video_cap=2,
             )
             candidates = list(allocation_result.selected)
@@ -1925,10 +2778,11 @@ class VQAPipelineV3:
                 candidate_pool,
                 video_ids,
                 max_vlm_candidates=max_vlm_candidates,
-                specialist_modalities=modalities,
+                specialist_modalities=selector_specialist_modalities,
                 specialist_reservation=1,
                 temporal_reservation=1,
                 per_video_cap=2,
+                prefer_specialist_anchors=bool(primary_specialist),
                 selection_policy=(
                     "adaptive" if visual_selector_policy == "adaptive" else "coverage"
                 ),
@@ -1947,6 +2801,7 @@ class VQAPipelineV3:
                     specialist_reservation=0,
                     temporal_reservation=0,
                     per_video_cap=2,
+                    prefer_specialist_anchors=False,
                     selection_policy=(
                         "adaptive" if visual_selector_policy == "adaptive" else "coverage"
                     ),
@@ -1983,11 +2838,7 @@ class VQAPipelineV3:
             "vlm_candidate_count": len(candidates),
             "modality_route": modalities, "route_requested": route_requested,
             "route_active": route_active,
-            "route_state": (
-                "specialist_success" if route_requested and all(specialist_hits.values()) else
-                ("specialist_partial" if route_requested and route_active else
-                 ("specialist_no_hit" if route_requested else "baseline_success"))
-            ),
+            "route_state": route_state,
             "route_fallback_reason": (
                 None if route_requested and all(specialist_hits.values()) or not route_requested else
                 ("specialist_partial_hit" if route_active else "specialist_returned_no_hit")
@@ -2003,8 +2854,22 @@ class VQAPipelineV3:
             ),
             "evidence_fusion": evidence_fusion_active,
             "visual_retrieved_video_ids": [str(row[0]) for row in visual_retrieved[:100]],
+            "baseline_visual_retrieved_video_ids": [
+                str(row[0]) for row in baseline_visual_retrieved[:100]
+            ],
             "rrf_videos": fused_videos,
             "routing_plan": routing_plan_record,
+            "query_plan": query_plan.to_dict(),
+            "hypothesis_plan": (
+                hypothesis_plan.to_dict() if hypothesis_plan is not None else {
+                    "status": (
+                        "not_eligible" if hypothesis_enabled else hypothesis_status
+                    )
+                }
+            ),
+            "routing_trace": routing_trace,
+            "image_grounding": image_grounding,
+            "image_visual_fusion": image_visual_fusion,
             "candidate_source_counts": {
                 source: sum(1 for item in candidates if has_source(item, source))
                 for source in sorted({source for item in candidates
@@ -2023,6 +2888,8 @@ class VQAPipelineV3:
                if return_candidate_pool else {}),
             "stages": {
                 "retrieval": {"visual_count": len(visual_retrieved),
+                              "baseline_visual_count": len(baseline_visual_retrieved),
+                              "external_image_count": len(image_candidates),
                                "specialist_counts": {
                                    modality: len(specialist_channels.get(modality, []))
                                    for modality in modalities}},
@@ -2068,6 +2935,50 @@ class VQAPipelineV3:
                     return True
         return False
 
+    @staticmethod
+    def _candidate_source_retrieval_rank(candidate, source: str):
+        """Return the best recorded rank for one source without mixing scales.
+
+        Global visual, ASR and OCR scores are not comparable.  The source
+        rank is, however, meaningful inside its own channel and is the right
+        deterministic tie-break once a Q&A task explicitly requires that
+        modality.  Prefer provenance because a deduplicated candidate's
+        top-level ``retrieval_rank`` can belong to another source.
+        """
+        wanted = str(source).strip().lower()
+        ranks = []
+        for record in candidate.get("provenance", ()) or ():
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("source", "")).strip().lower() != wanted:
+                continue
+            for key in ("retrieval_rank", "rank"):
+                try:
+                    value = int(record.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value >= 1:
+                    ranks.append(value)
+        if not ranks and has_source(candidate, wanted):
+            for key in ("retrieval_rank", "rank"):
+                try:
+                    value = int(candidate.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value >= 1:
+                    ranks.append(value)
+        fusion = candidate.get("video_fusion", {})
+        if isinstance(fusion, dict):
+            channel_ranks = fusion.get("channel_ranks", {})
+            if isinstance(channel_ranks, dict):
+                try:
+                    value = int(channel_ranks.get(wanted))
+                except (TypeError, ValueError):
+                    value = 0
+                if value >= 1:
+                    ranks.append(value)
+        return min(ranks) if ranks else None
+
     def select_prepared_candidates(
         self,
         prepared: dict,
@@ -2076,6 +2987,7 @@ class VQAPipelineV3:
         max_vlm_candidates: int = 12,
         required_modalities=None,
         visual_selector_policy: str = "adaptive",
+        allow_local_ocr_fallback: bool = False,
     ) -> dict:
         """Select the answer pool from one already-materialized retrieval pool.
 
@@ -2086,6 +2998,10 @@ class VQAPipelineV3:
         policy that keeps a visual answer frame and allocates a separate,
         payload-backed ASR/OCR candidate when that route needs it. The
         measured ``adaptive`` policy remains the default until promotion.
+
+        ``allow_local_ocr_fallback`` is diagnostic-only. Production callers
+        keep it false so a sampled global OCR miss cannot silently turn into
+        a visual-only answer described as OCR-grounded.
         """
         if not isinstance(prepared, dict):
             raise TypeError("prepared must be a mapping")
@@ -2101,21 +3017,23 @@ class VQAPipelineV3:
             str(video_id) for video_id in prepared.get("retrieved_video_ids", [])
         ][:int(top_videos)]
         modalities = self._parse_modalities(required_modalities)
-        local_ocr_fallback_enabled = (
-            modalities == ["ocr"] and self._local_vlm is not None
+        if not isinstance(allow_local_ocr_fallback, bool):
+            raise TypeError("allow_local_ocr_fallback must be a boolean")
+        local_ocr_fallback_enabled = bool(
+            allow_local_ocr_fallback
+            and modalities == ["ocr"]
+            and self._local_vlm is not None
         )
         policy = str(visual_selector_policy).strip().lower()
         if policy not in {"anchor_preserving", "balanced", "adaptive"}:
             raise ValueError(
                 "visual_selector_policy must be 'anchor_preserving', 'balanced', or 'adaptive'"
             )
+        # ASR and OCR are parallel evidence lanes, not an intersection filter.
+        # A decisive OCR frame may contain no speech (and vice versa). The
+        # allocator reserves specialist coverage; the primary evidence source
+        # is enforced at answer verification time.
         eligible_pool = pool
-        if policy != "anchor_preserving" and modalities and not local_ocr_fallback_enabled:
-            eligible_pool = [
-                item for item in pool
-                if all(self._candidate_has_modality_payload(item, modality)
-                       for modality in modalities)
-            ]
         if policy == "anchor_preserving":
             allocation = self._allocate_anchor_preserving_candidates(
                 eligible_pool,
@@ -2133,7 +3051,7 @@ class VQAPipelineV3:
                 specialist_reservation=1 if modalities else 0,
                 temporal_reservation=1 if not modalities else 0,
                 per_video_cap=2,
-                selection_policy=policy,
+                selection_policy="coverage" if policy == "balanced" else policy,
             )
         selected = [dict(item, selection_stage="selector") for item in allocation.selected]
         if local_ocr_fallback_enabled:
@@ -2185,6 +3103,7 @@ class VQAPipelineV3:
             "retrieval_pool_count": len(pool),
             "eligible_pool_count": len(eligible_pool),
             "required_modalities": list(modalities),
+            "modality_policy": "parallel_union_primary_verified",
             "local_ocr_fallback_enabled": local_ocr_fallback_enabled,
             "allocation": dict(allocation.diagnostics),
             "impossible_budget_reason": allocation.impossible_budget_reason,
@@ -2194,7 +3113,8 @@ class VQAPipelineV3:
     def answer_ranked_candidates(self, prepared: dict, *, max_answers: int = 20,
                                 max_new_tokens: int = 128, use_context: bool = True,
                                 structured_vlm: bool | None = None,
-                                rerank_weights: dict | None = None) -> dict:
+                                rerank_weights: dict | None = None,
+                                semantic_evidence_judge=None) -> dict:
         """Answer a prepared candidate set through the injected provider."""
         answer_provider = getattr(self, "answer_provider", None)
         if self._local_vlm is None and answer_provider is None:
@@ -2245,15 +3165,32 @@ class VQAPipelineV3:
             for source in prepared.get("required_sources", ())
             if str(source).strip().lower() in {"asr", "ocr"}
         )
-        question_type = canonical_question_type(prepared.get("question_type"))
-        # For screen-text questions, pixels are the primary answer evidence;
-        # the sampled OCR index is a retrieval specialist and may contain a
-        # ticker while missing the larger sign/title visible in the same
-        # frame.  Requiring lexical agreement with that sampled OCR text
-        # rejects valid visual reads.  Spoken facts remain strictly ASR-
-        # supported because speech is not recoverable from frame pixels.
-        semantic_required_sources = (
-            () if question_type == "screen_text" else required_sources
+        declared_sources = tuple(
+            str(source).strip().lower()
+            for source in prepared.get("declared_sources", required_sources)
+            if str(source).strip().lower() in {"asr", "ocr"}
+        )
+        support_sources = tuple(
+            str(source).strip().lower()
+            for source in prepared.get("support_sources", required_sources)
+            if str(source).strip().lower() in {"asr", "ocr"}
+        )
+        # A declared specialist modality is an evidence contract, not merely
+        # a retrieval hint.  In particular, accepting a screen-text answer
+        # from pixels after OCR missed its text made the output look grounded
+        # even though the OCR index could not support it.  Fail closed here;
+        # local OCR reading is available only through the explicit diagnostic
+        # selection flag above, never the production path.
+        semantic_required_sources = required_sources
+        active_semantic_judge = (
+            semantic_evidence_judge
+            if semantic_evidence_judge is not None else getattr(self, "semantic_evidence_judge", None)
+        )
+        semantic_judge_enabled = bool(getattr(active_semantic_judge, "enabled", False))
+        from src.vqa.claim_verifier import derive_claim_policy, verify_claim_roles
+        claim_policy = derive_claim_policy(
+            query,
+            specialist_sources=tuple(dict.fromkeys([*support_sources, *declared_sources])),
         )
 
         def trace_for(candidate, **extra):
@@ -2297,7 +3234,8 @@ class VQAPipelineV3:
                             query,
                             question,
                             evidence_provider=evidence_provider,
-                            modalities=required_sources,
+                            modalities=support_sources,
+                            claim_policy=claim_policy,
                         )
                     except (KeyError, ValueError, TypeError) as exc:
                         if not local_ocr_fallback:
@@ -2378,6 +3316,21 @@ class VQAPipelineV3:
                         continue
                 asr = " ".join(item["text"] for item in packet["asr_chunks"])
                 ocr = " | ".join(item["text"] for item in packet["ocr_text"])
+                # The provider sees same-video entity/condition proof, but
+                # later role verification keeps these rows separate from the
+                # answer-support contract.
+                claim_asr = [
+                    str(item.get("text", "")) for item in packet.get("claim_evidence", ())
+                    if isinstance(item, dict) and item.get("source") == "asr"
+                ]
+                claim_ocr = [
+                    str(item.get("text", "")) for item in packet.get("claim_evidence", ())
+                    if isinstance(item, dict) and item.get("source") == "ocr"
+                ]
+                if claim_asr:
+                    asr = " ".join([asr, *claim_asr]).strip()
+                if claim_ocr:
+                    ocr = " | ".join([ocr, *claim_ocr]).strip()
             elif use_context:
                 asr = self._asr_context(candidate["video_id"], candidate["pts_time"])
                 ocr = self._ocr_context(candidate["video_id"], candidate["pts_time"])
@@ -2519,13 +3472,93 @@ class VQAPipelineV3:
                 verification = verifier.verify(
                     normalized_answer,
                     evidence_mapping,
-                    required_sources=semantic_required_sources,
+                    # Claim-aware verification separates two roles: a source
+                    # may identify the programme/entity while another source
+                    # supplies the answer.  The legacy verifier still proves
+                    # literal answer support, but must not force one source
+                    # to play both roles.
+                    required_sources=(() if claim_policy.active else semantic_required_sources),
                 ).to_dict()
                 if verification.get("abstain"):
                     answer_trace.append(trace_for(
                         candidate,
                         status="rejected_verification",
                         verification=verification,
+                        provider=provider_name or record.get("provider"),
+                    ))
+                    continue
+                if claim_policy.active:
+                    if not isinstance(verification, dict):
+                        verification = {}
+                    claim_verification = verify_claim_roles(
+                        normalized_answer,
+                        packet or {},
+                        claim_policy,
+                        declared_sources=declared_sources,
+                        answer_sources=tuple(dict.fromkeys([*support_sources, *declared_sources])),
+                    )
+                    verification["claim_verification"] = claim_verification.to_dict()
+                    if not claim_verification.accepted:
+                        answer_trace.append(trace_for(
+                            candidate,
+                            status="rejected_claim_verification",
+                            verification=verification,
+                            provider=provider_name or record.get("provider"),
+                        ))
+                        continue
+            semantic_verdict = None
+            if semantic_judge_enabled:
+                # This second call has a distinct role from answer generation:
+                # it sees the same bounded, canonical bundle but may only
+                # accept/reject the proposed answer.  In particular, claim
+                # evidence that identifies an entity is not appended to these
+                # texts, so it cannot masquerade as answer evidence.
+                try:
+                    from src.vqa.semantic_evidence import (
+                        SemanticEvidenceRequest,
+                        SemanticEvidenceVerdict,
+                    )
+                    semantic_asr = (
+                        " ".join(item.get("text", "") for item in packet.get("asr_chunks", ()))
+                        if packet is not None else asr
+                    )
+                    semantic_ocr = (
+                        " | ".join(item.get("text", "") for item in packet.get("ocr_text", ()))
+                        if packet is not None else ocr
+                    )
+                    semantic_verdict = active_semantic_judge.judge(
+                        SemanticEvidenceRequest(
+                            query=query,
+                            question=question,
+                            candidate_id=f"{candidate['video_id']}#{candidate['kf_n']}",
+                            video_id=str(candidate["video_id"]),
+                            answer=normalized_answer,
+                            frames=self._provider_frame_evidence(candidate, packet),
+                            asr_text=semantic_asr,
+                            ocr_text=semantic_ocr,
+                            expected_sources=tuple(dict.fromkeys([
+                                "visual", *semantic_required_sources,
+                            ])),
+                        )
+                    )
+                    if not isinstance(semantic_verdict, SemanticEvidenceVerdict):
+                        raise TypeError("semantic evidence judge returned an invalid verdict")
+                except Exception as exc:
+                    # An explicitly enabled precision gate must fail closed;
+                    # a network/model error may not silently restore the
+                    # weaker answer-generator-only decision path.
+                    answer_trace.append(trace_for(
+                        candidate,
+                        status="rejected_semantic_evidence_error",
+                        error=f"{type(exc).__name__}: {exc}"[:240],
+                        provider=provider_name or record.get("provider"),
+                    ))
+                    continue
+                if not semantic_verdict.accepted:
+                    answer_trace.append(trace_for(
+                        candidate,
+                        status="rejected_semantic_evidence",
+                        semantic_evidence=semantic_verdict.to_dict(),
                         provider=provider_name or record.get("provider"),
                     ))
                     continue
@@ -2538,11 +3571,19 @@ class VQAPipelineV3:
                              "provider": provider_name or record.get("provider"),
                              "verification": verification,
                              "verification_policy": (
-                                 "visual_frame_primary"
-                                 if question_type == "screen_text"
-                                 else "specialist_text_required"
+                                 "specialist_text_required"
+                                 if semantic_required_sources
+                                 else "visual_frame_primary"
                              ),
                              "evidence_packet": packet,
+                             "semantic_evidence": (
+                                 semantic_verdict.to_dict()
+                                 if semantic_verdict is not None else None
+                             ),
+                             "semantic_evidence_score": (
+                                 semantic_verdict.relevance_score
+                                 if semantic_verdict is not None else 0.0
+                             ),
                              "evidence_support": evidence_support_score(normalized_answer, packet or {}),
                              "modality_fallback": "local_vlm_ocr" if local_ocr_fallback else None,
                              "structured_vlm": bool(structured_vlm),
@@ -2568,17 +3609,78 @@ class VQAPipelineV3:
         for item in answered:
             key = " ".join(item["answer"].lower().split())
             item["answer_consistency"] = groups[key] / max(len(answered), 1)
-            item["ranking_score"] = (
-                rank_weights["video_rank"] / (1.0 + item["video_rank"])
-                + rank_weights["visual_relevance"] * float(item["base_score"])
-                + rank_weights["answer_consistency"] * item["answer_consistency"]
+            verification_map = item.get("verification")
+            try:
+                required_evidence_support = float(
+                    verification_map.get("support_score", item["evidence_support"])
+                    if isinstance(verification_map, dict) else item["evidence_support"]
+                )
+            except (TypeError, ValueError):
+                required_evidence_support = 0.0
+            required_evidence_support = max(0.0, min(1.0, required_evidence_support))
+            item["required_evidence_support"] = required_evidence_support
+            direct_specialist_origin = bool(required_sources) and all(
+                has_source(item, source)
+                and self._candidate_has_modality_payload(item, source)
+                for source in required_sources
             )
-            if structured_vlm:
-                item["ranking_score"] += (
-                    rank_weights["grounding"] * item["grounding_score"] +
-                    rank_weights["answer_confidence"] * item["answer_confidence"] +
-                    (rank_weights["evidence_support"] * item["evidence_support"]
-                     if evidence_mode else 0.0)
+            item["direct_specialist_origin"] = direct_specialist_origin
+            direct_source_rank = [
+                self._candidate_source_retrieval_rank(item, source)
+                for source in required_sources
+            ]
+            direct_source_rank = [rank for rank in direct_source_rank if rank is not None]
+            item["specialist_retrieval_rank"] = (
+                min(direct_source_rank) if direct_source_rank else None
+            )
+
+            # For a task that explicitly requires ASR/OCR, evidence support
+            # and direct specialist provenance are lexicographic invariants.
+            # The old additive score gave video rank a much larger numerical
+            # range, allowing a visual candidate with incidental nearby text
+            # to outrank the direct ASR/OCR retrieval hit.  Source-local rank
+            # is comparable only after those invariants are satisfied.
+            if required_sources:
+                specialist_rank_key = (
+                    item["specialist_retrieval_rank"]
+                    if item["specialist_retrieval_rank"] is not None else 10**9
+                )
+                item["ranking_policy"] = "required_specialist_evidence_v1"
+                item["ranking_score"] = (
+                    2.0 * required_evidence_support
+                    + 1.0 * float(direct_specialist_origin)
+                    + (1.0 / (1.0 + specialist_rank_key)
+                       if specialist_rank_key < 10**9 else 0.0)
+                )
+                item["_ranking_key"] = (
+                    -required_evidence_support,
+                    -int(direct_specialist_origin),
+                    specialist_rank_key,
+                    int(item["video_rank"]),
+                    -float(item.get("grounding_score", 0.0)),
+                    -float(item.get("answer_confidence", 0.0)),
+                    -item["answer_consistency"],
+                    str(item["video_id"]),
+                    int(item["kf_n"]),
+                )
+            else:
+                item["ranking_policy"] = "visual_fusion_v1"
+                item["ranking_score"] = (
+                    rank_weights["video_rank"] / (1.0 + item["video_rank"])
+                    + rank_weights["visual_relevance"] * float(item["base_score"])
+                    + rank_weights["answer_consistency"] * item["answer_consistency"]
+                )
+                if structured_vlm:
+                    item["ranking_score"] += (
+                        rank_weights["grounding"] * item["grounding_score"] +
+                        rank_weights["answer_confidence"] * item["answer_confidence"] +
+                        (rank_weights["evidence_support"] * item["evidence_support"]
+                         if evidence_mode else 0.0)
+                    )
+                item["_ranking_key"] = (
+                    -item["ranking_score"],
+                    str(item["video_id"]),
+                    int(item["kf_n"]),
                 )
             item["rerank_stage"] = "rerank"
             item["rerank_provenance"] = stage_record(
@@ -2586,8 +3688,13 @@ class VQAPipelineV3:
                 answer=item["answer"],
                 evidence_sources=list((item.get("evidence_packet") or {}).get("sources", [])),
                 evidence_support=item.get("evidence_support", 0.0),
+                semantic_evidence=item.get("semantic_evidence"),
+                required_evidence_support=item["required_evidence_support"],
+                direct_specialist_origin=item["direct_specialist_origin"],
+                specialist_retrieval_rank=item["specialist_retrieval_rank"],
+                ranking_policy=item["ranking_policy"],
             )
-        answered.sort(key=lambda item: item["ranking_score"], reverse=True)
+        answered.sort(key=lambda item: item["_ranking_key"])
         output = []
         for item in answered[:max_answers]:
             output.append({
@@ -2595,14 +3702,20 @@ class VQAPipelineV3:
                 "kf_n": item["kf_n"], "pts_time": item["pts_time"],
                 "answer": item["answer"], "status": item["status"],
                 "ranking_score": item["ranking_score"],
+                "ranking_policy": item["ranking_policy"],
                 "answer_consistency": item["answer_consistency"],
                 "grounding_score": item.get("grounding_score", 0.0),
                 "answer_confidence": item.get("answer_confidence", 0.0),
                 "provider": item.get("provider"),
                 "verification": item.get("verification"),
                 "verification_policy": item.get("verification_policy"),
+                "semantic_evidence": item.get("semantic_evidence"),
+                "semantic_evidence_score": item.get("semantic_evidence_score", 0.0),
                 "evidence_sources": (item.get("evidence_packet") or {}).get("sources", []),
                 "evidence_support": item.get("evidence_support", 0.0),
+                "required_evidence_support": item.get("required_evidence_support", 0.0),
+                "direct_specialist_origin": bool(item.get("direct_specialist_origin")),
+                "specialist_retrieval_rank": item.get("specialist_retrieval_rank"),
                 "structured_vlm": bool(item.get("structured_vlm", False)),
                 "source": item.get("source", "visual"),
                 "sources": list(candidate_sources(item)),
@@ -2635,6 +3748,14 @@ class VQAPipelineV3:
             "vlm_candidate_count": int(prepared.get("vlm_candidate_count", len(candidates))),
             "rerank_weights": rank_weights,
             "structured_vlm": bool(structured_vlm),
+            "semantic_evidence_verifier": {
+                "enabled": semantic_judge_enabled,
+                "provider": (
+                    str(getattr(active_semantic_judge, "provider_name", "injected"))
+                    if semantic_judge_enabled else None
+                ),
+            },
+            "claim_policy": claim_policy.to_dict(),
             "selector_trace": list(prepared.get("selector_trace", ())),
             "answer_trace": answer_trace,
             "stages": {
@@ -2652,11 +3773,15 @@ class VQAPipelineV3:
                        max_new_tokens: int = 128,
                        use_context: bool = True,
                        offline: bool = True, question_type: str | None = None,
-                       required_modalities=None,
+                       required_modalities=None, support_modalities=None,
                        global_modality_router=None, rrf_weights: dict | None = None,
                        answer_rerank_weights: dict | None = None,
                        visual_selector_policy: str = "adaptive",
-                       evidence_fusion: bool | None = None) -> dict:
+                       evidence_fusion: bool | None = None,
+                       grounding_resolver=None,
+                       image_grounding_provider=None,
+                       hypothesis_generator=None,
+                       semantic_evidence_judge=None) -> dict:
         """Build a ranked, submission-safe Q&A result.
 
         Candidate generation is deliberately separate from answering: KIS ranks
@@ -2670,44 +3795,75 @@ class VQAPipelineV3:
             raise ValueError("offline ranked_answers cannot use a remote answer provider")
         if not offline and answer_provider is None:
             raise ValueError("online ranked_answers requires an explicit answer provider")
+        if offline and (
+            bool(getattr(grounding_resolver, "enabled", False))
+            or bool(getattr(image_grounding_provider, "enabled", False))
+        ):
+            raise ValueError("offline ranked_answers cannot use external grounding")
         question_type = normalize_question_type(question_type)
-        # Validate the modality contract before retrieval/model initialization.
+        # Validate both the answer contract and non-required retrieval lanes
+        # before retrieval/model initialization.
         self._parse_modalities(required_modalities)
-        if not required_modalities and question_type in {"screen_text", "spoken_fact"}:
-            required_modalities = f"visual,{'ocr' if question_type == 'screen_text' else 'asr'}"
+        self._parse_modalities(support_modalities)
+        # A question type is a routing hypothesis, not an implicit answer
+        # contract.  Only an explicit ``required_modalities`` declaration may
+        # require ASR/OCR evidence at answer time.
+        if support_modalities is None:
+            support_modalities = required_modalities
         prepared = self.prepare_ranked_candidates(
             query, question, top_videos=top_videos,
             frames_per_video=frames_per_video,
             max_vlm_candidates=max_vlm_candidates,
             temporal_consensus=temporal_consensus,
             required_modalities=required_modalities,
+            support_modalities=support_modalities,
             global_modality_router=global_modality_router,
             rrf_weights=rrf_weights,
             question_type=question_type,
             evidence_fusion=evidence_fusion,
             visual_selector_policy=visual_selector_policy,
+            grounding_resolver=grounding_resolver,
+            image_grounding_provider=image_grounding_provider,
+            hypothesis_generator=hypothesis_generator,
         )
         if answer_rerank_weights:
             prepared["rerank_weights"] = dict(answer_rerank_weights)
+        support_sources = list(prepared.get("modality_route", ()))
+        if not support_sources:
+            support_sources = self._parse_modalities(support_modalities)
+        prepared["support_sources"] = list(support_sources)
+        # Required evidence is intentionally not inferred from support lanes:
+        # an unknown live query may search ASR and OCR in parallel while the
+        # answer provider is allowed to use either valid evidence source.
+        required_sources = self._parse_modalities(required_modalities)
+        prepared["declared_sources"] = list(required_sources)
         prepared["required_sources"] = list(
-            self._parse_modalities(required_modalities)
+            self._primary_evidence_sources(question_type, required_sources)
         )
         prepared["question_type"] = question_type
+        prepared["support_modalities"] = list(self._parse_modalities(support_modalities))
+        prepared["required_modalities"] = list(required_sources)
         result = self.answer_ranked_candidates(
             prepared, max_answers=max_answers,
             max_new_tokens=max_new_tokens, use_context=use_context,
             rerank_weights=answer_rerank_weights,
+            semantic_evidence_judge=semantic_evidence_judge,
         )
         # Preserve retrieval/fallback provenance at the task boundary.  The
         # answer adapter ignores these diagnostics, while runtime orchestration
         # uses them to distinguish specialist success from a visual-only rescue.
         for key in (
-            "retrieved_video_ids", "visual_retrieved_video_ids", "rrf_videos",
+            "retrieved_video_ids", "visual_retrieved_video_ids",
+            "baseline_visual_retrieved_video_ids", "rrf_videos",
             "modality_route", "route_requested", "route_active", "route_state",
             "route_fallback_reason", "evidence_fusion", "candidate_source_counts",
             "specialist_candidate_count", "routing_plan", "candidate_state",
             "candidate_miss", "wrong_video_state", "wrong_video",
-            "selector_metrics", "selector_trace",
+            "selector_metrics", "selector_trace", "query_plan",
+            "routing_trace", "support_modalities", "required_modalities",
+            "declared_sources", "claim_policy",
+            "image_grounding", "image_visual_fusion",
+            "hypothesis_plan",
         ):
             if key in prepared:
                 result[key] = prepared[key]

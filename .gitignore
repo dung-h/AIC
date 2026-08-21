@@ -132,6 +132,7 @@ scripts/*
 !scripts/competition_preflight.sh
 !scripts/runtime_data_bootstrap.py
 !scripts/runtime_env.sh
+!scripts/smoke_direct_vqa.py
 !scripts/wsl_python.sh
 
 # IDE/local workspace state
