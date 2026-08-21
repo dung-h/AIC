@@ -210,6 +210,8 @@ HCMAI_PUBLIC_KEYFRAMES_URL=https://drive.google.com/drive/folders/<archive-id>
 HCMAI_PUBLIC_MODELS_URL=https://drive.google.com/drive/folders/<models-id>
 HCMAI_PUBLIC_MODEL_ROOT=/opt/hcmai-models
 HCMAI_PUBLIC_DOWNLOAD_ROOT=/opt/hcmai-downloads
+# Optional; this is already the default for the preselection runtime.
+HCMAI_PUBLIC_KEYFRAME_ARCHIVES=keyframes-L21-L25.tar,keyframes-L26-L30.tar
 ```
 
 If the server user is not root, grant it ownership of the two external asset
@@ -226,13 +228,25 @@ Then the public bootstrap has no OAuth token, rclone config, or API key:
 ./scripts/competition.sh public-bootstrap fetch --yes
 ```
 
-It downloads the six compressed keyframe archives, validates archive paths,
-extracts them to `data/keyframes`, and refuses to overwrite an existing
-runtime. The tool stores only local SHA-256 receipts because a public Drive
-folder does not expose the authenticated rclone MD5 manifest. Run preflight
-afterward; this validates the real index/model/frame contracts. The public
-bootstrap uses [gdown](https://github.com/wkentaro/gdown), which supports
-public Drive folders and resumes partial downloads.
+The default is deliberately minimal for the preselection corpus: it downloads
+only `keyframes-L21-L25.tar` and `keyframes-L26-L30.tar`, plus `bge-m3` and
+`Qwen2.5-VL-7B-Instruct`. It does **not** download the raw `data/keyframes`
+Drive tree, the four K-series archives, or Qwen 3B. It validates archive paths,
+extracts only the selected packs to `data/keyframes`, and refuses to overwrite
+an already present pack. The tool stores only local SHA-256 receipts because a
+public Drive folder does not expose the authenticated rclone MD5 manifest. Run
+preflight afterward; this validates the real index/model/frame contracts. The
+public bootstrap uses [gdown](https://github.com/wkentaro/gdown), which
+supports public Drive folders and resumes partial downloads.
+
+To install only additional K-series packs later, without redownloading the
+index or models, select the keyframe asset explicitly. Repeat `--archive` for
+each needed pack:
+
+```bash
+./scripts/competition.sh public-bootstrap fetch --yes --asset keyframes \
+  --archive keyframes-K01-K05.tar
+```
 
 Finally hydrate the two visual backbones once, then return to offline mode:
 
@@ -247,9 +261,9 @@ HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "$HCMAI_PYTHON" -c \
 ```
 
 The Drive bootstrap is intentionally not called from `run` or `preflight`:
-automatically downloading 90+ GB during a competition request is unsafe. On a
-new server the operator performs one explicit fetch; thereafter `run` is
-offline-first.
+automatically downloading a large runtime during a competition request is
+unsafe. On a new server the operator performs one explicit, selective fetch;
+thereafter `run` is offline-first.
 
 ## Competition commands
 

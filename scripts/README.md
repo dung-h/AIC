@@ -21,4 +21,8 @@ profiling scripts are diagnostic, not submission entrypoints.
 `public_runtime_bootstrap.py` is the credential-free equivalent for public
 Google Drive folders. It uses `gdown`, requires separate public links for
 `data/index`, `data/keyframe_archives_v2`, and `models`, and refuses to merge
-over an existing runtime. It must be invoked as `public-bootstrap fetch --yes`.
+over an existing runtime. Its default is the preselection L-series archives
+only and the production bge-m3/Qwen 7B models; it never downloads the legacy
+raw keyframe tree or Qwen 3B. Use `--asset keyframes --archive <pack>` to add
+one archive later without downloading indexes or models again. It must be
+invoked as `public-bootstrap fetch --yes`.
