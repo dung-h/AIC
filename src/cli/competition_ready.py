@@ -72,6 +72,53 @@ IMPORT_PROBE_TIMEOUT_SECONDS = 300
 _IMPORT_PROBE_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
 
 
+def _normalise_active_video_prefixes(value: object | None) -> tuple[str, ...]:
+    """Return the installed-corpus selector used by every retrieval lane.
+
+    The global metadata/index bundle intentionally contains both K and L
+    series.  A preselection deployment may install only the L keyframe
+    archives, so preflight must validate that *active* corpus rather than
+    reject the valid full metadata bundle or demand unavailable K images.
+    """
+    if value is None:
+        value = os.getenv("HCMAI_ACTIVE_VIDEO_PREFIXES", "")
+    if isinstance(value, str):
+        values = value.split(",")
+    else:
+        try:
+            values = list(value)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ValueError("active video prefixes must be a comma-separated string or sequence") from exc
+    prefixes = tuple(dict.fromkeys(str(item).strip().upper() for item in values if str(item).strip()))
+    if any(not prefix.replace("_", "").isalnum() for prefix in prefixes):
+        raise ValueError("active video prefixes must contain only alphanumeric characters or underscores")
+    return prefixes
+
+
+DEFAULT_ACTIVE_VIDEO_PREFIXES = _normalise_active_video_prefixes(None)
+
+
+def _default_expected_video_count(prefixes: Sequence[str]) -> int | None:
+    """Known corpus sizes; leave custom partial selections unconstrained."""
+    selected = frozenset(prefixes)
+    if not selected or selected == frozenset(("L", "K")):
+        return 1478
+    if selected == frozenset(("L",)):
+        return 873
+    return None
+
+
+def _is_active_video(video_id: str, prefixes: Sequence[str]) -> bool:
+    return not prefixes or str(video_id).strip().upper().startswith(tuple(prefixes))
+
+
+def _active_expected_packs(prefixes: Sequence[str]) -> set[str]:
+    return {
+        pack for pack in EXPECTED_PACKS
+        if not prefixes or pack.startswith(tuple(prefixes))
+    }
+
+
 @dataclass(frozen=True)
 class PreflightConfig:
     project_root: Path = ROOT
@@ -87,7 +134,10 @@ class PreflightConfig:
     output_dir: Path = DEFAULT_OUTPUT
     query_path: Path | None = None
     output_package: Path | None = None
-    expected_video_count: int | None = 1478
+    active_video_prefixes: tuple[str, ...] = DEFAULT_ACTIVE_VIDEO_PREFIXES
+    expected_video_count: int | None = field(
+        default_factory=lambda: _default_expected_video_count(DEFAULT_ACTIVE_VIDEO_PREFIXES)
+    )
     min_free_gb: float = 5.0
     require_gpu: bool = False
     require_modality_runtime: bool = False
@@ -135,7 +185,12 @@ def _parquet_metadata(path: Path, required: Iterable[str]) -> dict[str, Any]:
     return {"rows": int(metadata.num_rows), "columns": sorted(names)}
 
 
-def _canonical_summary(path: Path, *, collect_pairs: bool = False) -> tuple[dict[str, Any], set[tuple[str, int]] | None]:
+def _canonical_summary(
+    path: Path,
+    *,
+    active_video_prefixes: Sequence[str] = (),
+    collect_pairs: bool = False,
+) -> tuple[dict[str, Any], set[tuple[str, int]] | None]:
     import pyarrow.parquet as pq
 
     meta = _parquet_metadata(path, ("video_id", "kf_n", "frame_idx", "pts_time"))
@@ -150,6 +205,8 @@ def _canonical_summary(path: Path, *, collect_pairs: bool = False) -> tuple[dict
         video_id = str(video).strip().upper()
         if not video_id:
             raise ValueError("canonical map contains an empty video_id")
+        if not _is_active_video(video_id, active_video_prefixes):
+            continue
         kf_n, frame_idx = int(keyframe), int(frame_id)
         if kf_n < 0 or frame_idx < 0:
             raise ValueError("canonical map contains a negative frame identity")
@@ -160,7 +217,11 @@ def _canonical_summary(path: Path, *, collect_pairs: bool = False) -> tuple[dict
         video_ids.add(video_id)
         if pairs is not None:
             pairs.add((video_id, frame_idx))
-    meta.update({"videos": len(video_ids), "unique_identities": len(identities)})
+    meta.update({
+        "videos": len(video_ids),
+        "unique_identities": len(identities),
+        "active_video_prefixes": list(active_video_prefixes),
+    })
     return meta, pairs
 
 
@@ -274,7 +335,11 @@ def _check_gpu(builder: ReportBuilder, require_gpu: bool) -> None:
 
 def _check_canonical(builder: ReportBuilder, config: PreflightConfig, *, collect_pairs: bool) -> set[tuple[str, int]] | None:
     try:
-        summary, pairs = _canonical_summary(config.canonical_map, collect_pairs=collect_pairs)
+        summary, pairs = _canonical_summary(
+            config.canonical_map,
+            active_video_prefixes=config.active_video_prefixes,
+            collect_pairs=collect_pairs,
+        )
         expected = config.expected_video_count
         if expected is not None and summary["videos"] != expected:
             raise ValueError(f"video coverage {summary['videos']} != expected {expected}")
@@ -303,6 +368,8 @@ def _check_keyframes(builder: ReportBuilder, config: PreflightConfig) -> None:
             table.column("kf_n").to_pylist(),
         ):
             video_id = str(video).strip().upper()
+            if not _is_active_video(video_id, config.active_video_prefixes):
+                continue
             kf_n = int(keyframe)
             current = first_keyframe.get(video_id)
             if current is None or kf_n < current:
@@ -310,15 +377,18 @@ def _check_keyframes(builder: ReportBuilder, config: PreflightConfig) -> None:
         actual_videos = {path.name.upper() for path in root.iterdir() if path.is_dir()}
         expected_videos = set(first_keyframe)
         missing_dirs = sorted(expected_videos - actual_videos)
-        extra_dirs = sorted(actual_videos - expected_videos)
+        # A developer workstation may contain an installed superset.  It is
+        # harmless because retrieval is already bounded to active prefixes;
+        # only the selected corpus must be complete on a portable server.
+        inactive_extra_dirs = sorted(actual_videos - expected_videos)
         missing_probes = sorted(
             video_id for video_id, kf_n in first_keyframe.items()
             if not (root / video_id / f"{kf_n:03d}.jpg").is_file()
         )
-        if missing_dirs or extra_dirs or missing_probes:
+        if missing_dirs or missing_probes:
             raise ValueError(
                 "keyframe layout mismatch: "
-                f"missing_dirs={missing_dirs[:10]}, extra_dirs={extra_dirs[:10]}, "
+                f"missing_dirs={missing_dirs[:10]}, "
                 f"missing_probe_images={missing_probes[:10]}"
             )
     except Exception as exc:
@@ -329,11 +399,13 @@ def _check_keyframes(builder: ReportBuilder, config: PreflightConfig) -> None:
         return
     builder.add(
         "keyframe_images", True,
-        "Flat keyframe layout matches every canonical video",
+        "Flat keyframe layout matches every active canonical video",
         details={
             "path": _safe_path(config.keyframes_dir),
             "videos": len(expected_videos),
             "probe_images": len(first_keyframe),
+            "active_video_prefixes": list(config.active_video_prefixes),
+            "inactive_extra_videos": len(inactive_extra_dirs),
             "layout": "data/keyframes/<video_id>/<kf_n>.jpg",
         },
     )
@@ -417,7 +489,45 @@ def _resolve_artifact(directory: Path, manifest_path: Path, value: Any, fallback
     return directory / fallback
 
 
-def _check_modality(builder: ReportBuilder, name: str, directory: Path, expected_videos: int | None) -> None:
+def _active_modality_video_count(
+    manifest: dict[str, Any],
+    *,
+    prefixes: Sequence[str],
+    required_packs: set[str],
+) -> int:
+    """Read coverage from source metadata without mistaking text rows for videos.
+
+    Silent/no-text videos do not appear in retrieval parquet rows.  ASR v2 has
+    an explicit video-id list; OCR v2 records canonical counts per pack.
+    """
+    scope = manifest.get("scope") or {}
+    video_ids = scope.get("video_ids")
+    if isinstance(video_ids, list):
+        return len({str(video).strip().upper() for video in video_ids if _is_active_video(str(video), prefixes)})
+    if not prefixes:
+        return int(scope.get("video_count", 0))
+    records = manifest.get("packs") or {}
+    if not isinstance(records, dict):
+        raise ValueError("manifest pack coverage is not a mapping")
+    total = 0
+    for pack in required_packs:
+        item = records.get(pack) or records.get(pack.lower())
+        if not isinstance(item, dict):
+            raise ValueError(f"manifest is missing coverage record for {pack}")
+        value = item.get("canonical_videos", item.get("videos"))
+        if value is None:
+            raise ValueError(f"manifest coverage record for {pack} has no canonical video count")
+        total += int(value)
+    return total
+
+
+def _check_modality(
+    builder: ReportBuilder,
+    name: str,
+    directory: Path,
+    expected_videos: int | None,
+    active_video_prefixes: Sequence[str] = (),
+) -> None:
     import numpy as np
 
     manifest_name = "asr_global_merge_v2_manifest.json" if name == "asr" else "manifest.json"
@@ -434,10 +544,15 @@ def _check_modality(builder: ReportBuilder, name: str, directory: Path, expected
         if not bool((manifest.get("canonical") or {}).get("validated")):
             raise ValueError("manifest has no validated canonical mapping")
         packs = {str(item).upper() for item in (manifest.get("scope") or {}).get("packs", [])}
-        missing_packs = sorted(set(EXPECTED_PACKS) - packs)
+        required_packs = _active_expected_packs(active_video_prefixes)
+        missing_packs = sorted(required_packs - packs)
         if missing_packs:
             raise ValueError(f"missing packs: {missing_packs}")
-        video_count = int((manifest.get("scope") or {}).get("video_count", 0))
+        video_count = _active_modality_video_count(
+            manifest,
+            prefixes=active_video_prefixes,
+            required_packs=required_packs,
+        )
         if expected_videos is not None and video_count != expected_videos:
             raise ValueError(f"video coverage {video_count} != expected {expected_videos}")
         artifacts = manifest.get("artifacts") or {}
@@ -460,6 +575,8 @@ def _check_modality(builder: ReportBuilder, name: str, directory: Path, expected
             "shape": [int(value) for value in embeddings.shape],
             "packs": len(packs),
             "videos": video_count,
+            "active_packs": sorted(required_packs),
+            "active_video_prefixes": list(active_video_prefixes),
         }
         if name == "ocr":
             coverage = manifest.get("coverage") or {}
@@ -859,8 +976,8 @@ def run_preflight(config: PreflightConfig) -> dict[str, Any]:
     _check_keyframes(builder, config)
     _check_visual(builder, config)
     _check_visual_backbones(builder, config)
-    _check_modality(builder, "asr", config.asr_dir, config.expected_video_count)
-    _check_modality(builder, "ocr", config.ocr_dir, config.expected_video_count)
+    _check_modality(builder, "asr", config.asr_dir, config.expected_video_count, config.active_video_prefixes)
+    _check_modality(builder, "ocr", config.ocr_dir, config.expected_video_count, config.active_video_prefixes)
     _check_provider(builder, config)
     _check_output_dir(builder, config)
     _check_queries(builder, config.query_path)
@@ -874,6 +991,7 @@ def run_preflight(config: PreflightConfig) -> dict[str, Any]:
         "exit_code": 0 if not blockers else 1,
         "network_calls": 0,
         "provider": config.provider,
+        "active_video_prefixes": list(config.active_video_prefixes),
         "project_root": _safe_path(config.project_root),
         "blockers": blockers,
         "warnings": warnings,
@@ -897,7 +1015,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--query-path", type=Path)
     parser.add_argument("--output-package", type=Path)
-    parser.add_argument("--expected-video-count", type=int, default=1478, help="Use 0 to disable the corpus-size assertion")
+    parser.add_argument(
+        "--active-video-prefix", action="append", dest="active_video_prefixes",
+        help="Restrict preflight to installed video-id prefix(es); defaults to HCMAI_ACTIVE_VIDEO_PREFIXES",
+    )
+    parser.add_argument("--expected-video-count", type=int, default=None, help="Use 0 to disable the corpus-size assertion")
     parser.add_argument("--min-free-gb", type=float, default=5.0)
     parser.add_argument("--require-gpu", action="store_true")
     parser.add_argument(
@@ -913,8 +1035,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.min_free_gb < 0:
         raise SystemExit("--min-free-gb must be non-negative")
-    if args.expected_video_count < 0:
+    if args.expected_video_count is not None and args.expected_video_count < 0:
         raise SystemExit("--expected-video-count must be non-negative")
+    active_video_prefixes = _normalise_active_video_prefixes(
+        args.active_video_prefixes if args.active_video_prefixes is not None else DEFAULT_ACTIVE_VIDEO_PREFIXES
+    )
+    expected_video_count = (
+        _default_expected_video_count(active_video_prefixes)
+        if args.expected_video_count is None else args.expected_video_count or None
+    )
     config = PreflightConfig(
         project_root=args.project_root,
         canonical_map=args.canonical_map,
@@ -929,7 +1058,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output_dir,
         query_path=args.query_path,
         output_package=args.output_package,
-        expected_video_count=args.expected_video_count or None,
+        active_video_prefixes=active_video_prefixes,
+        expected_video_count=expected_video_count,
         min_free_gb=args.min_free_gb,
         require_gpu=args.require_gpu,
         require_modality_runtime=args.require_modality_runtime,

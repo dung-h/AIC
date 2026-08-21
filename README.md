@@ -181,7 +181,7 @@ HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 hf download \
   --cache-dir "$HF_HUB_CACHE" timm/ViT-SO400M-16-SigLIP2-384
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
-./scripts/competition.sh preflight --provider local --require-gpu \
+./scripts/competition.sh preflight --provider openai --require-gpu \
   --require-modality-runtime --json-output results/preflight.json
 ```
 

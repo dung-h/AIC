@@ -140,6 +140,58 @@ def test_missing_artifacts_fail_closed_and_main_returns_nonzero(tmp_path, capsys
     assert {"canonical_map", "visual_indexes", "asr_index", "ocr_index", "answer_provider"} <= set(report["blockers"])
 
 
+def test_l_only_preflight_accepts_full_metadata_but_requires_only_l_assets(tmp_path):
+    """The portable preselection deploy installs L images, not every K pack."""
+    canonical = tmp_path / "canonical.parquet"
+    pd.DataFrame({
+        "video_id": ["L21_V001", "K01_V001"],
+        "kf_n": [1, 1],
+        "frame_idx": [10, 10],
+        "pts_time": [0.4, 0.4],
+    }).to_parquet(canonical, index=False)
+    summary, pairs = competition_ready._canonical_summary(
+        canonical, active_video_prefixes=("L",), collect_pairs=True,
+    )
+    assert summary["videos"] == 1
+    assert pairs == {("L21_V001", 10)}
+
+    keyframes = tmp_path / "keyframes"
+    (keyframes / "L21_V001").mkdir(parents=True)
+    (keyframes / "L21_V001" / "001.jpg").write_bytes(b"jpeg-probe")
+    config = PreflightConfig(
+        canonical_map=canonical,
+        keyframes_dir=keyframes,
+        active_video_prefixes=("L",),
+        expected_video_count=1,
+    )
+    builder = competition_ready.ReportBuilder()
+    competition_ready._check_keyframes(builder, config)
+    assert builder.checks[0]["status"] == "pass"
+
+    for name in ("asr", "ocr"):
+        directory = tmp_path / name
+        _write_modality(directory, name, canonical)
+        manifest_path = directory / (
+            "asr_global_merge_v2_manifest.json" if name == "asr" else "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        l_packs = [f"L{number:02d}" for number in range(21, 31)]
+        manifest["scope"] = {"packs": l_packs, "video_count": 1}
+        if name == "asr":
+            manifest["scope"]["video_ids"] = ["L21_V001"]
+        else:
+            manifest["packs"] = {
+                pack: {"canonical_videos": 1 if pack == "L21" else 0}
+                for pack in l_packs
+            }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        modality_builder = competition_ready.ReportBuilder()
+        competition_ready._check_modality(
+            modality_builder, name, directory, expected_videos=1, active_video_prefixes=("L",),
+        )
+        assert modality_builder.checks[0]["status"] == "pass"
+
+
 def test_explicit_api_provider_never_prints_secret(tmp_path, monkeypatch):
     config = _ready_config(tmp_path, provider="openai")
     secret = "super-secret-value-must-not-leak"
